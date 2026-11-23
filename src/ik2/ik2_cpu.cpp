@@ -9,12 +9,29 @@
 
 namespace ik2::cpu {
 
-bool available() {
+namespace {
+bool avx512_ok() {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+    static const bool ok = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+                           __builtin_cpu_supports("avx512vl");
+    return ok;
 #else
     return false;
 #endif
+}
+bool avx2_ok() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+                           __builtin_cpu_supports("f16c");
+    return ok;
+#else
+    return false;
+#endif
+}
+}  // namespace
+
+bool available() {
+    return avx512_ok() || avx2_ok();
 }
 
 Pool::Pool(int n) {
@@ -125,6 +142,47 @@ void nvfp4_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, 
         out[r - r0] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     }
 }
+
+__attribute__((target("avx2,fma")))
+inline float hsum256(__m256 v) {
+    const __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    const __m128 t = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(_mm_add_ss(t, _mm_shuffle_ps(t, t, 1)));
+}
+
+// The same blocks as nvfp4_rows_avx512, eight lanes at a time: a 16-value sub-block is two __m256 halves
+// (values 0..7 the low nibbles, 8..15 the high nibbles of its 8 bytes), four accumulators for the FMA latency.
+__attribute__((target("avx2,fma")))
+void nvfp4_rows_avx2(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
+    const __m128i tab = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const int nb = K / 64;
+    const size_t rb = (size_t) nb * 36;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* b = W + (size_t) r * rb;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        const float* xp = x;
+        for (int i = 0; i < nb; ++i, b += 36, xp += 64) {
+#define IK2_SUB2(sb, accl, acch)                                                                   \
+    {                                                                                              \
+        const __m128i raw = _mm_loadl_epi64((const __m128i*) (b + 4 + (sb) * 8));                 \
+        const __m128i lo = _mm_and_si128(raw, m4);                                                 \
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);                              \
+        const __m256 vl = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_shuffle_epi8(tab, lo)));    \
+        const __m256 vh = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_shuffle_epi8(tab, hi)));    \
+        const __m256 s = _mm256_set1_ps(g_scale.v[b[sb]]);                                         \
+        accl = _mm256_fmadd_ps(vl, _mm256_mul_ps(_mm256_loadu_ps(xp + (sb) * 16), s), accl);      \
+        acch = _mm256_fmadd_ps(vh, _mm256_mul_ps(_mm256_loadu_ps(xp + (sb) * 16 + 8), s), acch);  \
+    }
+            IK2_SUB2(0, a0, a1)
+            IK2_SUB2(1, a2, a3)
+            IK2_SUB2(2, a0, a1)
+            IK2_SUB2(3, a2, a3)
+#undef IK2_SUB2
+        }
+        out[r - r0] = hsum256(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+    }
+}
 #endif
 
 void nvfp4_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
@@ -168,6 +226,33 @@ void q8_0_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, f
         out[r - r0] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     }
 }
+
+__attribute__((target("avx2,fma,f16c")))
+void q8_0_rows_avx2(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
+    const int nb = K / 32;
+    const size_t rb = (size_t) nb * 34;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* b = W + (size_t) r * rb;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        const float* xp = x;
+        for (int i = 0; i < nb; ++i, b += 34, xp += 32) {
+            uint16_t h;
+            std::memcpy(&h, b, 2);
+            const __m256 d = _mm256_set1_ps(_cvtsh_ss(h));
+            const __m128i q0 = _mm_loadu_si128((const __m128i*) (b + 2));
+            const __m128i q1 = _mm_loadu_si128((const __m128i*) (b + 18));
+            const __m256 v0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q0));
+            const __m256 v1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8)));
+            const __m256 v2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1));
+            const __m256 v3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8)));
+            a0 = _mm256_fmadd_ps(v0, _mm256_mul_ps(_mm256_loadu_ps(xp), d), a0);
+            a1 = _mm256_fmadd_ps(v1, _mm256_mul_ps(_mm256_loadu_ps(xp + 8), d), a1);
+            a2 = _mm256_fmadd_ps(v2, _mm256_mul_ps(_mm256_loadu_ps(xp + 16), d), a2);
+            a3 = _mm256_fmadd_ps(v3, _mm256_mul_ps(_mm256_loadu_ps(xp + 24), d), a3);
+        }
+        out[r - r0] = hsum256(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+    }
+}
 #endif
 
 float fp16_to_f32(uint16_t h) {
@@ -201,9 +286,12 @@ void q8_0_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, f
 
 void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    static const bool fast = available();
-    if (fast) {
+    if (avx512_ok()) {
         q8_0_rows_avx512(W, K, r0, r1, x, out);
+        return;
+    }
+    if (avx2_ok()) {
+        q8_0_rows_avx2(W, K, r0, r1, x, out);
         return;
     }
 #endif
@@ -212,9 +300,12 @@ void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* o
 
 void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    static const bool fast = available();
-    if (fast) {
+    if (avx512_ok()) {
         nvfp4_rows_avx512(W, K, r0, r1, x, out);
+        return;
+    }
+    if (avx2_ok()) {
+        nvfp4_rows_avx2(W, K, r0, r1, x, out);
         return;
     }
 #endif

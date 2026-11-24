@@ -172,10 +172,42 @@ struct Shards {
         auto it = by_name.find(n);
         return it == by_name.end() ? nullptr : it->second.second;
     }
+    // (measurement) IK2_X_DENSE4=attn|head|all: the attention's / the output head's Q8_0 matrices with their values
+    // rounded to 16 levels a block of 32 (as Q4_0 would hold them) - what a 4-bit copy would compute.  The bytes stay
+    // Q8_0: this measures the quality, not the speed.
     const uint8_t* data(const std::string& n) const {
         auto it = by_name.find(n);
         if (it == by_name.end()) die("no tensor " + n);
-        return files[it->second.first]->tensor_data(*it->second.second);
+        const uint8_t* p = files[it->second.first]->tensor_data(*it->second.second);
+        static const char* x4 = getenv("IK2_X_DENSE4");
+        if (!x4) return p;
+        const auto& t = *it->second.second;
+        const std::string sel = x4;
+        const bool head = n == "output.weight";
+        bool attn = false;
+        for (const char* suf : {".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_gate.weight",
+                                ".attn_output.weight", ".attn_rel.weight"})
+            attn = attn || (n.size() > std::strlen(suf) && n.compare(n.size() - std::strlen(suf), std::string::npos, suf) == 0);
+        if ((int) t.type != 8 || !((attn && sel != "head") || (head && sel != "attn"))) return p;
+        static std::map<std::string, std::vector<uint8_t>> copies;
+        auto& c = copies[n];
+        if (c.empty()) {
+            const size_t nblk = t.elements() / 32;
+            c.assign(p, p + nblk * 34);
+            for (size_t bl = 0; bl < nblk; ++bl) {
+                int8_t* q = (int8_t*) (c.data() + bl * 34 + 2);
+                int m = 0, at = 0;
+                for (int i = 0; i < 32; ++i)
+                    if (std::abs((int) q[i]) > m) m = std::abs((int) q[i]), at = i;
+                if (!m) continue;
+                const float step = q[at] < 0 ? m / 8.0f : m / 7.0f;
+                for (int i = 0; i < 32; ++i) {
+                    const int v = std::clamp((int) std::lround(q[i] / step), -8, 7);
+                    q[i] = (int8_t) std::clamp((int) std::lround(v * step), -127, 127);
+                }
+            }
+        }
+        return c.data();
     }
     uint64_t file_offset(const std::string& n) const {
         auto it = by_name.find(n);
@@ -357,6 +389,14 @@ float g_x_cache_bias = 0.0f;
 float* g_x_bias_d = nullptr;
 std::vector<std::vector<float>> g_x_bias_h;   // a layer's own bias, read back once
 uint64_t g_n_lazy_copies = 0;
+// (measurement, bench-2026-11-24/astra)
+//   IK2_LAZY_AFTER=1     a visit's lazy copy is queued once its CPU experts are done, not before: the copy reads the
+//                        same host memory the CPU lane does, and this way it runs beside the next visit's attention
+//   IK2_X_MISS_SKIP=f    changes the arithmetic: a pick missing from VRAM whose share of the visit's weights is under
+//                        f is left out, the others' weights scaled up to the same sum (one token, the cache path)
+bool g_lazy_after = false;
+float g_x_miss_skip = 0.0f;
+uint64_t g_n_miss_skip = 0;
 cudaStream_t g_ls = nullptr;          // IK2_LAZY_STREAM=1: lazy copies on their own stream
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
 constexpr int kRing = 256;
@@ -949,7 +989,7 @@ struct ExpertCache {
         return best;
     }
     bool worth_admitting(int l, int e, uint64_t t) const {
-        if (!schedule.active) return true;
+        if (!schedule.active || schedule.admit_always) return true;
         const Pool& P = pools[layer_pool[l]];
         if (P.free_head >= 0) return true;
         const int s = schedule_victim(P, t);
@@ -1169,6 +1209,10 @@ struct ExpertCache {
         }
         size_t rem = budget - used;
         bool grew = true;
+        if (const char* fs = getenv("IK2_POOL_SLOTS")) {   // (measurement: "a,b" - the pools' slots as given)
+            int a = 0, b = 0;
+            if (std::sscanf(fs, "%d,%d", &a, &b) == 2 && pools.size() == 2) pools[0].n_slots = a, pools[1].n_slots = b, grew = false;
+        }
         while (grew) {
             grew = false;
             for (size_t p = 0; p < pools.size(); ++p) {
@@ -3885,6 +3929,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             double acc_up = 0, acc_cpu = 0;
             int urgent[64], lazy[64], fit_cand[64];
             int n_urgent = 0, n_lazy = 0, n_fit_cand = 0;
+            const bool skip_on = g_x_miss_skip > 0 && T == 1 && cpu_lane;
+            float w_sum = 0, w_skipped = 0;
+            int n_skip = 0;
+            if (skip_on)
+                for (int i = 0; i < S; ++i) w_sum += w[i];
             for (int i = 0; i < S; ++i) {
                 const int e = top[i];
                 if (W.seen_stamp[e] == stp) {   // a second token of this call on an expert missing in it
@@ -3901,6 +3950,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                         if (cpu_lane && g_lazy_cpu) late[i] = 2, acc_cpu += t_cpu;
                         else late[i] = 1;
                     }
+                    continue;
+                }
+                if (skip_on && w[i] < g_x_miss_skip * w_sum) {   // (IK2_X_MISS_SKIP: a light pick that is not in VRAM)
+                    late[i] = 3, where[i] = nullptr, slot_of[i] = -1;
+                    w_skipped += w[i], ++n_skip;
                     continue;
                 }
                 // a miss: the CPU's or the link's, whichever is free first
@@ -3951,6 +4005,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 }
             }
             g_n_lazy_copies += n_lazy;
+            uint64_t lazy_seq = 0;
             for (int ui = 0; ui < n_urgent; ++ui) {
                 const int i = urgent[ui];
                 EC.copy_in(Ly, top[i], (uint8_t*) where[i], cst);
@@ -3964,12 +4019,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     g_seq_done = seq - 1;
                 }
                 const cudaStream_t lst = g_ls ? g_ls : g_cs;   // (IK2_LAZY_STREAM=1: a stream of their own)
+                lazy_seq = seq;
                 for (int li = 0; li < n_lazy; ++li) {
                     const int i = lazy[li];
-                    EC.copy_in(Ly, top[i], (uint8_t*) where[i], lst);
+                    if (!g_lazy_after) EC.copy_in(Ly, top[i], (uint8_t*) where[i], lst);
                     EC.slot_sseq(slot_of[i]) = seq;
                 }
-                CU(cudaEventRecord(g_ring[seq % kRing], lst));
+                if (!g_lazy_after) CU(cudaEventRecord(g_ring[seq % kRing], lst));
             }
             const int ps = W.pack_slot;
             W.pack_slot = (W.pack_slot + 1) % Work::kPackRing;
@@ -3978,17 +4034,23 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             float* yh = W.y_h[ps];
             int ph = 0, pm = nh, pc = nh + nw;
             ik2::cpu::ExpertJob jobs[64];
-            const int n_jobs = S - nh - nw;
+            const int n_jobs = S - nh - nw - n_skip;
+            g_n_miss_skip += n_skip;
+            const float w_keep = n_skip ? w_sum / std::max(1e-20f, w_sum - w_skipped) : 1.0f;
             if (T == 1) g_tl.lap(g_tl.decide);
             const double tc0 = now();
             for (int i = 0; i < S; ++i) {
+                if (late[i] == 3) {   // (left out: a row that exists, weight 0)
+                    id[i] = 0, wt[i] = 0.0f;
+                    continue;
+                }
                 const int e = top[i], p = late[i] == 2 ? pc++ : late[i] ? pm++ : ph++;
                 blob[p] = where[i];
                 tk[p] = i / c.K;
                 id[i] = p;
                 sg[p] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
                 su[p] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
-                wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
+                wt[i] = w[i] * w_keep * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
                 if (late[i] == 2) {
                     auto& J = jobs[p - nh - nw];
                     J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
@@ -4122,6 +4184,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 }
                 CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) (cpu_sum ? 1 : n_jobs) * C * 4,
                                    cudaMemcpyHostToDevice, g_s));
+            }
+            if (g_lazy_after && n_lazy > 0) {   // (the CPU lane is done with the host memory: the copy has it alone)
+                const cudaStream_t lst = g_ls ? g_ls : g_cs;
+                for (int li = 0; li < n_lazy; ++li)
+                    EC.copy_in(Ly, top[lazy[li]], (uint8_t*) where[lazy[li]], lst);
+                CU(cudaEventRecord(g_ring[lazy_seq % kRing], lst));
             }
             k::moe_combine_f32(W.y32, pid, pwt, T, c.K, C, W.tmp, false, g_s);
             g_pf.lap(g_pf.experts);
@@ -4620,6 +4688,43 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 
 }  // namespace
 
+// ---- measurement only (bench-2026-11-24/astra): counters over a span of a serve request's decode
+struct MeasSnap {
+    double t = 0, wall = 0;
+    uint64_t hits = 0, misses = 0, cpu = 0, lazy = 0, wait = 0, skips = 0, mskip = 0;
+    double tl[8] = {};
+};
+static MeasSnap meas_take() {
+    MeasSnap m;
+    ExpertCache& e = dev_cache(0);
+    m.wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    m.t = now(), m.hits = e.hits, m.misses = e.misses, m.cpu = g_n_cpu, m.lazy = g_n_lazy_copies, m.wait = g_n_wait;
+    m.skips = e.admission_skips, m.mskip = g_n_miss_skip;
+    const double v[8] = {g_tl.launch_attn, g_tl.sync_wait, g_tl.decide, g_tl.launch_hits,
+                         g_tl.pool_wait,   g_tl.tail,      g_tl.head,   g_tl.other};
+    for (int i = 0; i < 8; ++i) m.tl[i] = v[i];
+    return m;
+}
+static void meas_print(const char* tag, const MeasSnap& a, const MeasSnap& b, int fw, int pos) {
+    const double n = std::max(1, fw);
+    std::printf("%s t0=%.3f t1=%.3f pos=%d fw=%d ms=%.1f tok_s=%.2f hits=%.1f miss=%.1f cpu=%.1f lazy=%.2f wait=%.2f skip=%.2f mskip=%.2f tl:", tag,
+                a.wall, b.wall, pos, fw, (b.t - a.t) * 1e3, fw / std::max(1e-9, b.t - a.t), (b.hits - a.hits) / n,
+                (b.misses - a.misses) / n, (b.cpu - a.cpu) / n, (b.lazy - a.lazy) / n, (b.wait - a.wait) / n,
+                (b.skips - a.skips) / n, (b.mskip - a.mskip) / n);
+    for (int i = 0; i < 8; ++i) std::printf(" %.2f", (b.tl[i] - a.tl[i]) * 1e3 / n);
+    std::printf("\n");
+}
+static void meas_occ(int n_layer, int E) {   // IK2_OCC=1: the slots each layer's experts hold
+    ExpertCache& e = dev_cache(0);
+    std::printf("OCC");
+    for (int l = 0; l < n_layer; ++l) {
+        int n = 0;
+        for (int x = 0; x < E; ++x) n += e.loc[(size_t) l * E + x] >= 0;
+        std::printf(" %d", n);
+    }
+    std::printf("\n");
+}
+
 int main(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
@@ -4857,6 +4962,8 @@ int main(int argc, char** argv) {
     g_lazy_fit = getenv("IK2_LAZY_FIT_MS") ? std::atof(getenv("IK2_LAZY_FIT_MS")) * 1e-3 : 0;
     g_cpu_sum = !getenv("IK2_CPU_SUM") || std::atoi(getenv("IK2_CPU_SUM"));
     g_x_cache_bias = getenv("IK2_X_CACHE_BIAS") ? (float) std::atof(getenv("IK2_X_CACHE_BIAS")) : 0.0f;
+    g_lazy_after = getenv("IK2_LAZY_AFTER") && std::atoi(getenv("IK2_LAZY_AFTER"));
+    g_x_miss_skip = getenv("IK2_X_MISS_SKIP") ? std::clamp((float) std::atof(getenv("IK2_X_MISS_SKIP")), 0.0f, 0.12f) : 0.0f;
     if (getenv("IK2_LAZY_STREAM") && std::atoi(getenv("IK2_LAZY_STREAM")) && n_gpu == 1) {
         int lo = 0, hi = 0;
         CU(cudaDeviceGetStreamPriorityRange(&lo, &hi));
@@ -5620,6 +5727,9 @@ int main(int argc, char** argv) {
             for (const auto& v : M.V) visits.push_back(v.l);
             EC.schedule.init(visits, c.n_layer, c.E, c.K);
             EC.schedule.enabled = true;
+            if (getenv("IK2_SCHED_MODE")) EC.schedule.mode = std::atoi(getenv("IK2_SCHED_MODE"));
+            if (getenv("IK2_SCHED_ALPHA")) EC.schedule.alpha = (float) std::atof(getenv("IK2_SCHED_ALPHA"));
+            EC.schedule.admit_always = getenv("IK2_SCHED_ADMIT") && std::atoi(getenv("IK2_SCHED_ADMIT"));
             std::printf("expert cache policy: schedule (past routing frequency / visits until next use)\n");
         } else if (std::strcmp(policy, "fifo") != 0) {
             die("IK2_CACHE_POLICY must be fifo or schedule");
@@ -6950,6 +7060,15 @@ int main(int argc, char** argv) {
                 stops = parse_ints(stops_s);
             }
             const std::vector<int> ids = parse_ints(ids_s);
+            std::vector<int> forced;   // (measurement: IK2_FORCE_Q=FILE, a line of ids a request - the tokens it "generates")
+            {
+                static std::ifstream fq;
+                static bool fq_open = false;
+                if (!fq_open && getenv("IK2_FORCE_Q")) fq.open(getenv("IK2_FORCE_Q")), fq_open = true;
+                std::string fl;
+                if (fq_open && std::getline(fq, fl)) forced = parse_ints(fl);
+                if (!forced.empty()) max_new = (int) forced.size();
+            }
             if (ids.empty() || (int) ids.size() + max_new > ctx) {
                 if (serve_maya)
                     std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0\n",
@@ -7161,7 +7280,17 @@ int main(int argc, char** argv) {
             int suffix_at = 0;
             SuffixStats suffix_stats;
             size_t next_placement = hist.size() + kPlacementInterval;
+            static const int meas_win = getenv("IK2_WIN") ? std::atoi(getenv("IK2_WIN")) : 0;
+            const bool meas_on = getenv("IK2_MEAS") != nullptr;
+            const MeasSnap meas0 = meas_take();
+            MeasSnap meas_w = meas0;
+            int meas_fw = 0, meas_fw_w = 0;
             for (int i = 0; i < max_new; ++i) {
+                if (meas_on && meas_win && meas_fw - meas_fw_w >= meas_win) {
+                    const MeasSnap mn = meas_take();
+                    meas_print("WIN", meas_w, mn, meas_fw - meas_fw_w, (int) hist.size());
+                    meas_w = mn, meas_fw_w = meas_fw;
+                }
                 if (g_managed_experts && hist.size() >= next_placement) {
                     place_decode(M, (int)hist.size());
                     next_placement = hist.size() + kPlacementInterval;
@@ -7170,7 +7299,8 @@ int main(int argc, char** argv) {
                     reason = "cancelled";
                     break;
                 }
-                const int tok = temp <= 0             ? greedy_tok
+                const int tok = i < (int) forced.size() ? forced[i]
+                                : temp <= 0           ? greedy_tok
                                 : pending_sample >= 0 ? pending_sample
                                 : cand                ? pick_cand()
                                                       : pick(last.data());
@@ -7178,11 +7308,12 @@ int main(int argc, char** argv) {
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
-                if (std::find(stops.begin(), stops.end(), tok) != stops.end()) {
+                if (forced.empty() && std::find(stops.begin(), stops.end(), tok) != stops.end()) {
                     reason = "stop";
                     break;
                 }
                 if (i + 1 == max_new) break;
+                ++meas_fw;
                 if (suffix_window && i >= suffix_at) {
                     std::vector<int> next;
                     const int n =
@@ -7267,6 +7398,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
                              (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
                              (unsigned long long) sctl.drafted, (unsigned long long) sctl.plain);
+            if (meas_on) {
+                CU(cudaStreamSynchronize(g_s));
+                meas_print("STAT", meas0, meas_take(), meas_fw, (int) hist.size());
+                if (getenv("IK2_OCC")) meas_occ(c.n_layer, c.E);
+            }
             if (serve_maya)
                 std::printf("DONE %d %zu %.1f %.1f %s %d %d %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
                             (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason,
@@ -7600,8 +7736,10 @@ int main(int argc, char** argv) {
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
     if (g_pool && g_cpu_batches)
-        std::printf("CPU lane batches: %ld, %.1f us each, Q8_0 %.2f ms a job; %llu lazy copies\n", g_cpu_batches,
-                    g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3, (unsigned long long) g_n_lazy_copies);
+        std::printf("CPU lane batches: %ld, %.1f us each, Q8_0 %.2f ms a job; %llu lazy copies; %llu misses left out, %llu "
+                    "admissions refused\n", g_cpu_batches, g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3,
+                    (unsigned long long) g_n_lazy_copies, (unsigned long long) g_n_miss_skip,
+                    (unsigned long long) dev_cache(0).admission_skips);
     if (g_tl.on && g_tl.tokens)
         std::printf("timeline, ms a token over %ld tokens: launching attention %.2f, waiting for the GPU %.2f, cache "
                     "decisions and copies %.2f, launching the hits %.2f, waiting for the CPU lane %.2f, tail %.2f, "

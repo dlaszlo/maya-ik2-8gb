@@ -45,6 +45,31 @@ it rejects incompatible profiling/CPU-disabled configurations.
 
 Raw build and replay results: `validation/`.
 
+## Measured on the GPU afterwards (2026-11-24, RTX 4060 8 GB, context 131072)
+
+A recorded agent session (9 requests, 6645 generated tokens, the context growing from 2.8k to 10.2k) replayed
+through serve mode with the recorded answers fed (`IK2_FORCE_Q`), so every variant runs the same tokens; windows
+in which other programs used the processor are left out:
+
+| | tok/s | CPU experts a token | lazy copies a token |
+|---|---:|---:|---:|
+| fifo | 28.1 | 105 | 36 |
+| schedule | 29.9 | 96 | 30 |
+| fifo, `IK2_X_CACHE_BIAS=0.1` | 35.2 | 51 | 25 |
+| schedule, `IK2_X_CACHE_BIAS=0.1` | 36.9 | 47.5 | 15 |
+
+- The policy never slowed the engine on a quiet machine. Other programs' processor use does, with either policy
+  (the CPU lane 17 -> 57-87 ms a token), and so does a smaller cache when another program holds VRAM at the start.
+- The "visits until the layer's next visit" divisor has no effect: `IK2_SCHED_MODE=1` (pick probability times the
+  layer's visits a token) gives the same misses in the replay (102.3 a token both) and the same speed. The gain is
+  the pick frequency and the refused admissions (about 48 a token).
+- 0.05 is a good average: 0.02 was slower in the engine (27.1 against 29.3 tok/s), above 0.1 the replay has more
+  misses.
+- Against the unchanged engine: KL 0.0015-0.0017 (0.0000-0.0001 between two unchanged runs), from which experts the
+  CPU lane computes; with the bias 0.006-0.008, as with fifo (0.008-0.016).
+- Not measured: the policy with the bias after another conversation has filled the cache (the bias prefers what is
+  in VRAM, the policy admits fewer new experts).
+
 ## Run on the GPU host
 
 Rebuild if source changes:

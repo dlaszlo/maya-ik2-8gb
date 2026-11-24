@@ -1,0 +1,5 @@
+fifo delay=0 tokens=1199 CPU_experts/token=109.578 copies/token=37.209 policy_us/token=6.9 admission_skips=0 halves_cpu=109.26/109.89 halves_copies=37.39/37.03
+schedule delay=0 tokens=1199 CPU_experts/token=98.676 copies/token=30.349 policy_us/token=100.2 admission_skips=55734 halves_cpu=99.17/98.19 halves_copies=30.46/30.24
+fifo delay=2 tokens=1199 CPU_experts/token=113.816 copies/token=27.221 policy_us/token=6.7 admission_skips=0 halves_cpu=114.69/112.94 halves_copies=27.38/27.06
+schedule delay=2 tokens=1199 CPU_experts/token=103.080 copies/token=25.374 policy_us/token=99.2 admission_skips=46503 halves_cpu=104.54/101.62 halves_copies=25.45/25.30
+PASS: queue/location invariants, current-pick and in-flight protection, lend/give_back

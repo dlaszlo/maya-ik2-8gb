@@ -22,6 +22,7 @@
 // prompt position, F32 raw files ([T][C], [T][n_vocab]) - what tools/ik2_compare.py holds against ref/inkling2.py's
 // seams.  Settings (IK2_*): docs/SETTINGS.md.
 #include "ik2_cpu.hpp"
+#include "ik2_cache_policy.hpp"
 #include "ik2_cpu_deep.hpp"
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
@@ -932,6 +933,37 @@ struct ExpertCache {
     int tp = -1;         // IK2_TP: this GPU's half of every expert (its index), not whole experts
     uint64_t tick = 0, hits = 0, misses = 0, bytes_up = 0;
     double t_up = 0;
+    ik2::cache::Schedule schedule;
+    uint64_t admission_skips = 0;
+
+    // Current picks are pinned before looking for victims; a lazy copy still in flight is never evicted.
+    // Keep the original FIFO queues consistent, so prefill/lend/give_back can still use them unchanged.
+    int schedule_victim(const Pool& P, uint64_t t) const {
+        int best = -1;
+        float lowest = 0.0f;
+        for (int s = 0; s < P.n_active; ++s) {
+            if (P.owner[s] < 0 || P.used[s] >= t || P.sseq[s] > g_seq_done) continue;
+            const float value = schedule.value(P.owner[s]);
+            if (best < 0 || value < lowest) best = s, lowest = value;
+        }
+        return best;
+    }
+    bool worth_admitting(int l, int e, uint64_t t) const {
+        if (!schedule.active) return true;
+        const Pool& P = pools[layer_pool[l]];
+        if (P.free_head >= 0) return true;
+        const int s = schedule_victim(P, t);
+        return s >= 0 && schedule.value(l * E + e) > schedule.value(P.owner[s]);
+    }
+    void observe_decode(int visit, int l, const int* top, int count, uint64_t t) {
+        schedule.observe(visit, l, top, count);
+        if (!schedule.active) return;
+        Pool& P = pools[layer_pool[l]];
+        for (int i = 0; i < count; ++i) {
+            const int s = loc[l * E + top[i]];
+            if (s >= 0) P.used[s] = t;
+        }
+    }
 
     static void push_back(Pool& P, int q, int s) {
         P.qid[s] = (uint8_t) q;
@@ -1194,7 +1226,9 @@ struct ExpertCache {
         }
         ++misses;
         if (missed) *missed = true;
-        const int best = alloc_slot(P, t, scan);
+        int best = schedule.active && P.free_head < 0 ? schedule_victim(P, t) : -1;
+        if (best >= 0) unlink(P, best);
+        else best = alloc_slot(P, t, scan);
         if (P.owner[best] >= 0) {
             const int old_idx = P.owner[best];
             loc[old_idx] = -1;
@@ -3566,6 +3600,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const int* top = W.route_h;
         const float* w = (const float*) (W.route_h + S);
         pop_count(l, top, S);
+        EC.schedule.active = false;   // schedule policy only applies to the one-token CPU/cache path below
         g_pf.lap(g_pf.route);
         if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
             FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
@@ -3836,6 +3871,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             float sg[64], su[64], wt[64];
             const uint64_t tick = ++EC.tick;
             const cudaStream_t cst = g_overlap && !g_prof ? g_cs : g_s;
+            if (T == 1 && cpu_lane) EC.observe_decode(vis, l, top, S, tick);
             const uint8_t* where[64];
             char late[64] = {};
             int slot_of[64];
@@ -3872,10 +3908,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     late[i] = 2, acc_cpu += t_cpu;
                     // (IK2_LAZY_MAX / IK2_LAZY_PER: at most that many lazy batches in flight and copies a call, so
                     //  a narrow link is not queued up with them; past either the expert is only computed)
-                    const bool lazy_ok = g_lazy_fit <= 0 && g_cpu_lazy &&
+                    const bool admission_ok = EC.worth_admitting(l, e, tick);
+                    if (!admission_ok) ++EC.admission_skips;
+                    const bool lazy_ok = admission_ok && g_lazy_fit <= 0 && g_cpu_lazy &&
                                          (g_lazy_max <= 0 || (int) (g_seq_next - 1 - g_seq_done) < g_lazy_max) &&
                                          (g_lazy_per <= 0 || n_lazy < g_lazy_per);
-                    if (g_lazy_fit > 0) {   // (decided below, once the visit's CPU experts are counted)
+                    if (admission_ok && g_lazy_fit > 0) {   // (decided below, once the visit's CPU experts are counted)
                         where[i] = nullptr, slot_of[i] = -1;
                         fit_cand[n_fit_cand++] = i;
                     } else if (lazy_ok) {   // a slot for its blocks, copied in afterwards
@@ -3903,7 +3941,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 if (g_lazy_max > 0) budget = std::min(budget, g_lazy_max - (int) (g_seq_next - 1 - g_seq_done));
                 for (int j = 0; j < n_fit_cand; ++j) {
                     const int i = fit_cand[j];
-                    if (j < budget) {
+                    if (j < budget && EC.worth_admitting(l, top[i], tick)) {
                         where[i] = EC.get(Ly, l, top[i], tick, cst, nullptr, false, false);
                         slot_of[i] = EC.last_handle;
                         lazy[n_lazy++] = i;
@@ -5574,6 +5612,19 @@ int main(int argc, char** argv) {
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
+    if (const char* policy = getenv("IK2_CACHE_POLICY")) {
+        if (std::strcmp(policy, "schedule") == 0) {
+            if (!g_pool || n_gpu != 1 || !g_overlap || g_prof || !g_mv)
+                die("IK2_CACHE_POLICY=schedule requires the single-GPU CPU lane, overlap and MV, without IK2_PROF");
+            std::vector<int> visits;
+            for (const auto& v : M.V) visits.push_back(v.l);
+            EC.schedule.init(visits, c.n_layer, c.E, c.K);
+            EC.schedule.enabled = true;
+            std::printf("expert cache policy: schedule (past routing frequency / visits until next use)\n");
+        } else if (std::strcmp(policy, "fifo") != 0) {
+            die("IK2_CACHE_POLICY must be fifo or schedule");
+        }
+    }
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
                 EC.pools.size(), EC.total_bytes() / 1073741824.0, now() - t_start);
     for (size_t p = 0; p < EC.pools.size(); ++p)

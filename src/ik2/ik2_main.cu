@@ -194,7 +194,33 @@ struct Shards {
         if (c.empty()) {
             const size_t nblk = t.elements() / 32;
             c.assign(p, p + nblk * 34);
-            for (size_t bl = 0; bl < nblk; ++bl) {
+            // IK2_X_DENSE4_NV=1: the values as NVFP4 would hold them instead (a scale every 16 values, the levels
+            // 0 1 2 3 4 6 8 12 times it, the scale of the least squared error at and below the largest value / 12)
+            static const bool nv = getenv("IK2_X_DENSE4_NV") && std::atoi(getenv("IK2_X_DENSE4_NV"));
+            for (size_t sub = 0; nv && sub < nblk * 2; ++sub) {
+                static const float lv[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+                int8_t* q = (int8_t*) (c.data() + (sub / 2) * 34 + 2 + (sub & 1) * 16);
+                int m = 0;
+                for (int i = 0; i < 16; ++i) m = std::max(m, std::abs((int) q[i]));
+                if (!m) continue;
+                float best_e = -1.0f;
+                int8_t best[16] = {};
+                for (int kk = 0; kk <= 6; ++kk) {
+                    const float sc = m / 12.0f * std::exp2(-kk / 8.0f);
+                    float e = 0.0f;
+                    int8_t r[16];
+                    for (int i = 0; i < 16; ++i) {
+                        const float x = std::fabs((float) q[i]) / sc;
+                        const int li = x < 3.5f ? (int) (x + 0.5f) : x < 5.0f ? 4 : x < 7.0f ? 5 : x < 10.0f ? 6 : 7;
+                        const float y = lv[li] * sc;
+                        e += (y - std::fabs((float) q[i])) * (y - std::fabs((float) q[i]));
+                        r[i] = (int8_t) std::clamp((int) std::lround(q[i] < 0 ? -y : y), -127, 127);
+                    }
+                    if (best_e < 0 || e < best_e) best_e = e, std::memcpy(best, r, 16);
+                }
+                std::memcpy(q, best, 16);
+            }
+            for (size_t bl = 0; !nv && bl < nblk; ++bl) {
                 int8_t* q = (int8_t*) (c.data() + bl * 34 + 2);
                 int m = 0, at = 0;
                 for (int i = 0; i < 32; ++i)
@@ -257,6 +283,7 @@ struct Mat {
     uint8_t* raw = nullptr;     // IK2_DENSE=q8: the blocks, one token's products straight over them
     uint16_t* f16 = nullptr;    // else (the default): an FP16 copy, every product a cuBLAS GEMM - measured faster on an
     int type = 0, N = 0, K = 0; // RTX PRO 6000 (16 against 21 ms a token), for 4 GiB more VRAM
+    float scale = 1.0f;         // raw: the products are this times the blocks' (upload_nvfp4)
 };
 
 struct Layer {
@@ -489,8 +516,9 @@ T* dalloc(size_t n) {
 }
 
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
-void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
-    const float one = 1.0f;
+void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f,
+            float alpha = 1.0f) {
+    const float one = alpha;
     CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, Kd, &one, W, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &beta, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
@@ -584,7 +612,8 @@ void add_f16_shadow(Mat& m) {
     else k::decode_f16(m.type, m.raw, (size_t) m.N * m.K, m.f16, g_s);
 }
 
-Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
+bool upload_nvfp4(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values);
+Mat load_mat(const Shards& S, const std::string& n, int N, int Kd, bool q4 = false) {
     const auto* t = S.info(n);
     if (!t) die("no tensor " + n);
     if (t->elements() != (uint64_t) N * Kd) die(n + ": " + std::to_string(t->elements()) + " values");
@@ -594,6 +623,7 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     m.type = (int) t->type, m.N = N, m.K = Kd;
     const size_t nb = tensor_bytes(*t);
     if (g_dense_q8) {
+        if (q4 && upload_nvfp4(m, {S.data(n)}, {(size_t) N * Kd})) return m;
         if (upload_planar(m, {S.data(n)}, {(size_t) N * Kd})) return m;
         m.raw = dalloc<uint8_t>(nb);
         CU(cudaMemcpy(m.raw, S.data(n), nb, cudaMemcpyHostToDevice));
@@ -608,6 +638,106 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     k::decode_f16(m.type, g_stage, (size_t) N * Kd, m.f16, g_s);
     CU(cudaStreamSynchronize(g_s));
     return m;
+}
+
+// IK2_DENSE4=head|attn|all: the output head / the attention's matrices (Q8_0 in the file, 8.5 bits a value) kept
+// as NVFP4 blocks (4.5 bits: the experts' format - 64 values a block, a UE4M3 scale every 16 values, the values
+// 0 1 2 3 4 6 8 12 times it, signed), written here from the file's blocks.  On a card the experts do not fit on, a
+// token's time is the bytes it reads: at 128k on 8 GB about 3 GiB, 1.3 of it the attention's matrices (27 MiB a
+// layer visit) and 0.47 the head.  This halves those reads and leaves the bytes for the expert cache; the products
+// are not the file's any more (measured against the unchanged model with IK2_FORCE and IK2_LOGITS_OUT).
+// A sub-block's scale is the one of the seven codes at and below its largest value / 12 with the least squared
+// error.  UE4M3's normal range starts at 2^-7 and the matrices' values are far smaller, so the blocks hold the
+// matrix divided by m.scale, which the products multiply back (mv_blocks' scale, the GEMM's alpha).
+int g_dense4 = 0;   // bit 0: the head, bit 1: the attention
+std::string g_dense4_note;
+bool upload_nvfp4(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
+    if (m.type != k::kQ8_0 || m.K % 64) return false;
+    std::vector<size_t> sub0{0};   // the first sub-block of each part
+    for (size_t v : part_values) sub0.push_back(sub0.back() + v / 16);
+    const size_t n_sub = sub0.back();
+    auto half = [](uint16_t h) {
+        const int e = (h >> 10) & 31, mt = h & 1023;
+        const float v = e == 0 ? std::ldexp((float) mt, -24) : std::ldexp((float) (mt + 1024), e - 25);
+        return (h & 0x8000) ? -v : v;
+    };
+    auto value16 = [&](size_t sub, float* v) {   // the 16 values of a sub-block
+        const size_t pi = (size_t) (std::upper_bound(sub0.begin(), sub0.end(), sub) - sub0.begin()) - 1;
+        const size_t ls = sub - sub0[pi];
+        const uint8_t* b = parts[pi] + (ls / 2) * 34;
+        const float d = half((uint16_t) (b[0] | (b[1] << 8)));
+        const int8_t* q = (const int8_t*) b + 2 + (ls & 1) * 16;
+        for (int j = 0; j < 16; ++j) v[j] = d * (float) q[j];
+    };
+    const int n_th = (int) std::clamp<size_t>(std::min<size_t>(std::thread::hardware_concurrency(), n_sub / 65536), 1, 16);
+    std::vector<float> th_max(n_th, 0.0f);
+    auto each = [&](auto f) {
+        std::vector<std::thread> th;
+        for (int i = 0; i < n_th; ++i) th.emplace_back([&, i] { f(i, n_sub * i / n_th, n_sub * (i + 1) / n_th); });
+        for (auto& x : th) x.join();
+    };
+    each([&](int i, size_t a, size_t b) {
+        float v[16], mx = 0.0f;
+        for (size_t sub = a; sub < b; ++sub) {
+            value16(sub, v);
+            for (int j = 0; j < 16; ++j) mx = std::max(mx, std::fabs(v[j]));
+        }
+        th_max[i] = mx;
+    });
+    const float w_max = *std::max_element(th_max.begin(), th_max.end());
+    if (!(w_max > 0)) return false;
+    const float scale = w_max / 12.0f / 128.0f;   // (the largest sub-block's scale is 128; UE4M3 goes up to 240)
+    float sc[127];
+    for (int c = 0; c < 127; ++c) sc[c] = c < 8 ? (float) c * 0x1.0p-10f : std::ldexp(1.0f + (c & 7) / 8.0f, (c >> 3) - 8);
+    std::vector<uint8_t> out(n_sub / 4 * 36);
+    std::vector<double> th_err(n_th, 0.0), th_pow(n_th, 0.0);
+    each([&](int i, size_t a, size_t b) {
+        static const float lv[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+        float v[16];
+        double err = 0, pw = 0;
+        for (size_t sub = a; sub < b; ++sub) {
+            value16(sub, v);
+            float mx = 0.0f;
+            for (int j = 0; j < 16; ++j) v[j] /= scale, mx = std::max(mx, std::fabs(v[j])), pw += (double) v[j] * v[j];
+            uint8_t* blk = out.data() + (sub / 4) * 36;
+            const int sb = (int) (sub & 3);
+            const int c0 = std::min((int) (std::lower_bound(sc + 1, sc + 127, mx / 12.0f) - sc), 126);
+            int best_c = 0;
+            float best_e = 0.0f;
+            uint8_t best_q[16] = {};
+            if (mx > 0) {
+                best_e = -1.0f;
+                for (int c = std::max(1, c0 - 6); c <= c0; ++c) {
+                    const float inv = 1.0f / sc[c];
+                    float e = 0.0f;
+                    uint8_t q[16];
+                    for (int j = 0; j < 16; ++j) {
+                        const float x = std::min(std::fabs(v[j]) * inv, 12.0f);
+                        const int li = x < 3.5f ? (int) (x + 0.5f) : x < 5.0f ? 4 : x < 7.0f ? 5 : x < 10.0f ? 6 : 7;
+                        const float dlt = std::fabs(v[j]) - lv[li] * sc[c];
+                        e += dlt * dlt;
+                        q[j] = (uint8_t) (li | (v[j] < 0 && li ? 8 : 0));
+                    }
+                    if (best_e < 0 || e < best_e) best_e = e, best_c = c, std::memcpy(best_q, q, 16);
+                }
+            }
+            err += best_e;
+            blk[sb] = (uint8_t) best_c;
+            for (int j = 0; j < 8; ++j) blk[4 + sb * 8 + j] = (uint8_t) (best_q[j] | (best_q[8 + j] << 4));
+        }
+        th_err[i] = err, th_pow[i] = pw;
+    });
+    double err = 0, pw = 0;
+    for (int i = 0; i < n_th; ++i) err += th_err[i], pw += th_pow[i];
+    m.type = k::kNVFP4;
+    m.scale = scale;
+    m.raw = dalloc<uint8_t>(out.size());
+    CU(cudaMemcpy(m.raw, out.data(), out.size(), cudaMemcpyHostToDevice));
+    static double tot_err = 0, tot_n = 0, tot_mib = 0;
+    tot_err += std::sqrt(err / std::max(pw, 1e-30)), tot_n += 1, tot_mib += out.size() / 1048576.0;
+    g_dense4_note = "IK2_DENSE4: " + std::to_string((int) tot_n) + " matrices as NVFP4, " + std::to_string((int) tot_mib) +
+                    " MiB (mean relative error " + std::to_string(tot_err / tot_n) + ")";
+    return true;
 }
 
 struct SegPack {
@@ -710,7 +840,7 @@ Mat load_fused_f16(const Shards& S, const std::vector<MatPart>& parts, int Kd) {
     return m;
 }
 
-bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int Kd, Mat& out) {
+bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int Kd, Mat& out, bool q4 = false) {
     int ty = -1, N_tot = 0;
     size_t nb_tot = 0;
     for (const auto& pt : parts) {
@@ -733,6 +863,7 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
         std::vector<const uint8_t*> ps;
         std::vector<size_t> vs;
         for (const auto& pt : parts) ps.push_back(S.data(pt.name)), vs.push_back((size_t) pt.N * Kd);
+        if (q4 && upload_nvfp4(out, ps, vs)) return true;
         if (upload_planar(out, ps, vs)) return true;
     }
     out.raw = dalloc<uint8_t>(nb_tot);
@@ -748,7 +879,7 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
 // one token's product over a dense matrix kept as the GGUF's blocks, or planar
 void mv1(const Mat& m, const float* x, float* y) {
     if (m.q8) k::mv_q8p(m.q8, m.q8d, m.N, m.K, x, y, g_s);
-    else k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s);
+    else k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s, m.scale);
 }
 // ... with up to two short convs on its rows: the planar Q8 product has them as its epilogue (a launch less each;
 // those rows of y are then not written), any other matrix gets the product and then the convs
@@ -757,7 +888,7 @@ void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::
         k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, x, y, c0, c1, g_s);
         return;
     }
-    k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s);
+    k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s, m.scale);
     for (const k::MvConv* cv : {&c0, &c1})
         if (cv->n) k::conv4_res(y + cv->r0, cv->hist, cv->w, cv->dyn, cv->heads, 1, cv->n, cv->res, cv->y, g_s);
 }
@@ -772,8 +903,8 @@ size_t g_w16_n = 0;          // values it holds
 // Y [T][N] = X [T][K] . W^T: one token straight over the blocks (x32), more through an FP16 decode and a GEMM (x16).
 // A matrix larger than the decode buffer (the head: its few rows of logits) goes a token at a time over its blocks.
 void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
-    if (m.f16) {
-        gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
+    if (m.f16) {   // (an FP16 shadow of scaled blocks, add_f16_shadow, holds the blocks' values: the scale here)
+        gemm16(m.f16, m.N, m.K, x16, T, Y, ldy, 0.0f, m.raw ? m.scale : 1.0f);
         return;
     }
     static const bool use_q8_tile = getenv("IK2_Q8_TILE") && atoi(getenv("IK2_Q8_TILE"));
@@ -796,7 +927,7 @@ void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y
     }
     if (m.q8) k::decode_q8p_f16(m.q8, m.q8d, (size_t) m.N * m.K, g_w16, g_s);
     else k::decode_f16(m.type, m.raw, (size_t) m.N * m.K, g_w16, g_s);
-    gemm16(g_w16, m.N, m.K, x16, T, Y, ldy);
+    gemm16(g_w16, m.N, m.K, x16, T, Y, ldy, 0.0f, m.q8 ? 1.0f : m.scale);
 }
 
 std::vector<float> host_f32(const Shards& S, const std::string& n, size_t expect) {
@@ -4875,6 +5006,12 @@ int main(int argc, char** argv) {
         g_group_exp = v == 1 || v >= 3, g_group_attn = v >= 2;
     }
     g_dense_q8 = getenv("IK2_DENSE") && std::string(getenv("IK2_DENSE")) == "q8";
+    if (const char* d4 = getenv("IK2_DENSE4")) {
+        const std::string v = d4;
+        g_dense4 = v == "head" ? 1 : v == "attn" ? 2 : v == "all" ? 3 : v == "" || v == "0" ? 0 : -1;
+        if (g_dense4 < 0) die("IK2_DENSE4 must be head, attn or all");
+        if (g_dense4 && !g_dense_q8) die("IK2_DENSE4 needs IK2_DENSE=q8");
+    }
     if (getenv("IK2_KV")) {
         const std::string kv = getenv("IK2_KV");
         if (kv == "f16" || kv == "fp16") g_kv_fp8 = false;
@@ -4960,6 +5097,7 @@ int main(int argc, char** argv) {
                     c.core1 - 1, c.n_pass, c.n_visit, c.rank);
         // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
         if (!draft_path.empty() && (c.C != 2304 || c.n_visit != 48)) die("--draft: a looped model other than Inkling-2-Mini");
+        if (!draft_path.empty() && g_dense4) die("IK2_DENSE4: not with --draft");
     }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
     g_tp_F = c.F, g_tp_C = c.C;
@@ -5232,7 +5370,7 @@ int main(int argc, char** argv) {
                 qkv_parts.push_back({"", c.H, std::move(sink_v)});
                 Ly.wqkvrg = load_fused_f16(S, qkv_parts, (int) C);
             } else {
-                if (!try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg)) {
+                if (!try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg, g_dense4 & 2)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C);
                     Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C);
@@ -5257,19 +5395,19 @@ int main(int argc, char** argv) {
                 Ly.wv_dyn = load_fused_f16(S, {{b + "attn_v.weight", (int) KD, {}}, {"", c.KV * 4, std::move(vd_v)}},
                                            (int) C);
             } else {
-                if (!try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg)) {
+                if (!try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg, g_dense4 & 2)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wr = load_mat(S, nm(b, "attn_r.weight"), c.H * c.d_rel, (int) C);
                     Ly.wgate = load_mat(S, b + "attn_gate.weight", (int) HD, (int) C);
                 }
-                Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C);
-                Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C);
+                Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C, g_dense4 & 2);
+                Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C, g_dense4 & 2);
                 Ly.sink16 = dev_f16(sink_v);
                 Ly.sc_k_dyn16 = dev_f16(kd_v);
                 Ly.sc_v_dyn16 = dev_f16(vd_v);
             }
         }
-        Ly.wo = load_mat(S, b + "attn_output.weight", (int) C, (int) HD);
+        Ly.wo = load_mat(S, b + "attn_output.weight", (int) C, (int) HD, g_dense4 & 2);
         Ly.router16 = load_f16(S, b + "ffn_gate_inp.weight", (size_t) c.E * C);
         Ly.probs_b = load_f32(S, b + "exp_probs_b.bias", c.E);
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
@@ -5395,7 +5533,8 @@ int main(int argc, char** argv) {
         Vi.h_mlp = dalloc<float>((size_t) g_parallel * 3 * C);
     }
     c.n_rows = (int) (S.info("output.weight")->elements() / C);
-    M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
+    M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C, g_dense4 & 1);
+    if (!g_dense4_note.empty()) std::printf("%s\n", g_dense4_note.c_str());
     if (g_dense_q8) {   // (a layer's largest; the head's logits go a token at a time over its blocks)
         g_w16_n = (2 * HD + 2 * KD + (size_t) c.H * c.d_rel) * C;
         g_w16 = dalloc<uint16_t>(g_w16_n);

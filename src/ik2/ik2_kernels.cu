@@ -3634,7 +3634,8 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
 }
 
 template <int WARPS, int ROWS>
-__global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_t rb, const float* x, float* y) {
+__global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_t rb, const float* x, float* y,
+                                 float scale) {
     extern __shared__ float xs[];
     load_xs_f32(x, K, xs);
     __syncthreads();
@@ -3643,7 +3644,7 @@ __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_
         const int row = (blockIdx.x * WARPS + warp) * ROWS + j;
         if (row >= N) break;
         const float v = row_dot(type, W + (size_t) row * rb, xs, K);
-        if ((threadIdx.x & 31) == 0) y[row] = v;
+        if ((threadIdx.x & 31) == 0) y[row] = v * scale;
     }
 }
 
@@ -6164,20 +6165,20 @@ void attn_multi_fp8(const float* q, const float* r, const float* sink, const uin
 }
 
 template <int WARPS, int ROWS>
-void launch_mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
+void launch_mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s, float scale) {
     mv_blocks_kernel<WARPS, ROWS><<<(unsigned) ((N + WARPS * ROWS - 1) / (WARPS * ROWS)), WARPS * 32,
-                                    xp_floats(K) * 4, s>>>(type, W, N, K, mv_row_bytes(type, K), x, y);
+                                    xp_floats(K) * 4, s>>>(type, W, N, K, mv_row_bytes(type, K), x, y, scale);
 }
 
-void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
+void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s, float scale) {
     if (N <= 0) return;
     if (K > 8192 || !block_values(type) || K % block_values(type)) {
         std::fprintf(stderr, "ik2::k::mv_blocks: type %d, K %d\n", type, K);
         std::abort();
     }
-    if (N <= 512) launch_mv_blocks<2, 1>(type, W, N, K, x, y, s);
-    else if (N <= 2048) launch_mv_blocks<4, 1>(type, W, N, K, x, y, s);
-    else launch_mv_blocks<4, 2>(type, W, N, K, x, y, s);
+    if (N <= 512) launch_mv_blocks<2, 1>(type, W, N, K, x, y, s, scale);
+    else if (N <= 2048) launch_mv_blocks<4, 1>(type, W, N, K, x, y, s, scale);
+    else launch_mv_blocks<4, 2>(type, W, N, K, x, y, s, scale);
     check("mv_blocks");
 }
 

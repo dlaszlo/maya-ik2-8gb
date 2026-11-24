@@ -203,7 +203,7 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
 
 /// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
 /// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
-void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s, float scale = 1.0f);
 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.

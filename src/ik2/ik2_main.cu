@@ -949,8 +949,14 @@ struct ExpertCache {
     struct Pool {
         size_t slot_bytes = 0;
         int n_slots = 0, prob_cap = 0, n_layers = 0;
-        int n_active = 0;               // slots in use as cache; [n_active, n_slots) lent out (lend)
+        int n_active = 0;               // slots in use as cache; [n_active, n_own) lent out (lend)
+        int n_own = 0;                  // slots in data; [n_own, n_slots) are borrowed ones (kv_lend_init)
+        int n_ext_on = 0;               // borrowed slots in use now
         uint8_t* data = nullptr;
+        std::vector<uint8_t*> ext;      // borrowed slot (s - n_own) -> its address
+        std::vector<uint8_t> ext_on;    // borrowed slot (s - n_own) in use as cache
+        uint8_t* at(int s) const { return s < n_own ? data + (size_t) s * slot_bytes : ext[s - n_own]; }
+        int live() const { return n_active + n_ext_on; }
         std::vector<int> owner;         // slot -> expert idx (l * E + e), -1 if free
         std::vector<uint64_t> used;     // slot -> last tick
         std::vector<uint64_t> sseq;     // slot -> lazy batch seq (0: none)
@@ -981,7 +987,7 @@ struct ExpertCache {
     int schedule_victim(const Pool& P, uint64_t t) const {
         int best = -1;
         float lowest = 0.0f;
-        for (int s = 0; s < P.n_active; ++s) {
+        for (int s = 0; s < P.n_slots; ++s) {   // (a slot lent out or taken back has no owner)
             if (P.owner[s] < 0 || P.used[s] >= t || P.sseq[s] > g_seq_done) continue;
             const float value = schedule.value(P.owner[s]);
             if (best < 0 || value < lowest) best = s, lowest = value;
@@ -1236,8 +1242,83 @@ struct ExpertCache {
             P.next.assign(P.n_slots, -1);
             for (int s = 0; s < P.n_slots - 1; ++s) P.next[s] = s + 1;
             P.free_head = P.n_slots > 0 ? 0 : -1;
-            P.n_active = P.n_slots;
+            P.n_active = P.n_own = P.n_slots;
         }
+    }
+    // IK2_KV_LEND=1: the unused ends of the full-attention visits' K / V arrays as cache slots.  --max-context sets
+    // the arrays' size (2 GiB at 128k with FP8), a conversation fills them from the front, and the expert cache
+    // beside them is what decides the speed on a small card.  The slots lie from an array's end down, a level being
+    // one slot in each array; kv_rows() is told the context's end before every forward and takes back the levels the
+    // rows are about to reach (their experts are dropped: computed by the CPU lane or copied again like any miss),
+    // and puts levels back in use when the context is shorter again.
+    struct KvLend {
+        int pool = -1, n_arr = 0, levels = 0, on = 0, margin = 0;
+        size_t arr_bytes = 0, row_bytes = 0;
+        uint64_t taken = 0, given = 0;
+    } kv;
+    void kv_lend_init(int p, const std::vector<uint8_t*>& arrs, size_t arr_bytes, size_t row_bytes, int margin_rows) {
+        Pool& P = pools[p];
+        const int n_arr = (int) arrs.size();
+        int levels = (int) (arr_bytes / P.slot_bytes);
+        levels = std::min(levels, n_arr > 0 ? std::max(0, P.n_layers * E - P.n_slots) / n_arr : 0);
+        if (levels <= 0) return;
+        kv.pool = p, kv.n_arr = n_arr, kv.levels = levels, kv.on = 0, kv.margin = margin_rows;
+        kv.arr_bytes = arr_bytes, kv.row_bytes = row_bytes;
+        const int k = levels * n_arr;
+        P.ext.resize(k);
+        for (int j = 0; j < levels; ++j)
+            for (int a = 0; a < n_arr; ++a) P.ext[(size_t) j * n_arr + a] = arrs[a] + arr_bytes - (size_t) (j + 1) * P.slot_bytes;
+        P.ext_on.assign(k, 0);
+        P.n_slots += k;
+        P.owner.resize(P.n_slots, -1);
+        P.used.resize(P.n_slots, 0);
+        P.sseq.resize(P.n_slots, 0);
+        P.qid.resize(P.n_slots, 0);
+        P.freq.resize(P.n_slots, 0);
+        P.prev.resize(P.n_slots, -1);
+        P.next.resize(P.n_slots, -1);
+    }
+    int kv_levels_for(int rows, size_t slack) const {
+        const size_t need = (size_t) (rows + kv.margin) * kv.row_bytes + slack;
+        if (need >= kv.arr_bytes) return 0;
+        return (int) std::min<size_t>((size_t) kv.levels, (kv.arr_bytes - need) / pools[kv.pool].slot_bytes);
+    }
+    // rows: the context's end after the forward about to run (its K / V rows are [0, rows))
+    void kv_rows(int rows) {
+        if (kv.pool < 0) return;
+        Pool& P = pools[kv.pool];
+        int target = kv.on;
+        const int must = kv_levels_for(rows, 0);
+        if (must < kv.on) {
+            target = must;
+        } else {   // (back in use only with half a slot to spare: no flapping around a boundary)
+            const int may = kv_levels_for(rows, P.slot_bytes / 2);
+            if (may > kv.on) target = may;
+        }
+        if (target == kv.on) return;
+        // Nothing may be in flight on either side of the boundary: a copy into a slot being taken back (a prefetched
+        // expert nobody waited for), or K / V rows still being written where a slot is about to be.
+        CU(cudaStreamSynchronize(g_s));
+        CU(cudaStreamSynchronize(g_cs));
+        if (g_ls) CU(cudaStreamSynchronize(g_ls));
+        g_seq_done = g_seq_next - 1;
+        for (int i = std::min(target, kv.on) * kv.n_arr; i < std::max(target, kv.on) * kv.n_arr; ++i) {
+            const int s = P.n_own + i;
+            if (target < kv.on) {
+                unlink(P, s);
+                if (P.owner[s] >= 0) loc[P.owner[s]] = -1, P.owner[s] = -1;
+                P.used[s] = 0, P.sseq[s] = 0, P.freq[s] = 0;
+                P.ext_on[i] = 0;
+                ++kv.taken;
+            } else {
+                P.ext_on[i] = 1;
+                ++kv.given;
+            }
+        }
+        kv.on = target;
+        P.n_ext_on = target * kv.n_arr;
+        P.prob_cap = std::max(1, P.live() / 5);
+        rebuild_free(P);
     }
     int total_slots() const {
         int s = 0;
@@ -1266,7 +1347,7 @@ struct ExpertCache {
             P.used[s] = t;
             if (P.freq[s] < kMaxFreq) ++P.freq[s];
             last_handle = (p << 20) | s;
-            return P.data + (size_t) s * P.slot_bytes;
+            return P.at(s);
         }
         ++misses;
         if (missed) *missed = true;
@@ -1279,7 +1360,7 @@ struct ExpertCache {
             if (!is_prefill) ghost_at[old_idx] = P.ghost_seq;
         }
         if (!is_prefill) ++P.ghost_seq;
-        const bool is_ghost = !is_prefill && ghost_at[idx] != 0 && (P.ghost_seq - ghost_at[idx]) <= (uint64_t) P.n_slots;
+        const bool is_ghost = !is_prefill && ghost_at[idx] != 0 && (P.ghost_seq - ghost_at[idx]) <= (uint64_t) P.live();
         P.owner[best] = idx;
         P.used[best] = t;
         P.sseq[best] = 0;
@@ -1287,7 +1368,7 @@ struct ExpertCache {
         push_back(P, is_ghost ? 2 : 1, best);
         loc[idx] = best;
         last_handle = (p << 20) | best;
-        uint8_t* dst = P.data + (size_t) best * P.slot_bytes;
+        uint8_t* dst = P.at(best);
         if (copy) copy_in(Ly, e, dst, st);
         return dst;
     }
@@ -1307,8 +1388,12 @@ struct ExpertCache {
     }
     static void rebuild_free(Pool& P) {
         P.free_head = -1;
-        for (int s = P.n_active - 1; s >= 0; --s)
+        auto add = [&](int s) {
             if (P.owner[s] < 0 && P.qid[s] == 0) P.next[s] = P.free_head, P.prev[s] = -1, P.free_head = s;
+        };
+        for (int s = P.n_slots - 1; s >= P.n_own; --s)
+            if (P.ext_on[s - P.n_own]) add(s);
+        for (int s = P.n_active - 1; s >= 0; --s) add(s);
     }
     // Lends the last k cache slots of pool p as one block of scratch (the experts in them are dropped), for a long
     // prefill whose passes stream the experts anyway; give_back() makes them cache slots again. Nothing may be in
@@ -1328,7 +1413,7 @@ struct ExpertCache {
     }
     void give_back(int p) {
         Pool& P = pools[p];
-        P.n_active = P.n_slots;
+        P.n_active = P.n_own;
         rebuild_free(P);
     }
     bool has(int l, int e) const { return loc[l * E + e] >= 0; }
@@ -1961,7 +2046,7 @@ void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work
     if (!g_overlap || g_prof || l >= M.c.n_layer || (!dual() && M.L[l].dev != g_cur)) return;
     const Work& U = Wpop ? *Wpop : W;   // (whose picks so far: under EP, GPU 0's)
     const int E = M.c.E, pi = EC.layer_pool[l];
-    if (pi < 0 || EC.pools[pi].n_active < (ahead + 1) * E + 64) return;
+    if (pi < 0 || EC.pools[pi].live() < (ahead + 1) * E + 64) return;
     Layer& Ly = M.L[l];
     const uint64_t t = EC.tick + (uint64_t) ahead;   // (the tick its layer will run in: kept till then)
     W.pf_bs[pr].assign(E, -1);
@@ -3511,6 +3596,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     use_dev(M.L[0].dev);
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
+    dev_cache(0).kv_rows(pos0 + T);   // (IK2_KV_LEND: the cache slots these K / V rows reach are taken back first)
 #define W (*Wp)
 #define EC (*ECp)
     // the embedding rows, normed (pinned host staging, no stream sync needed)
@@ -4349,6 +4435,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
     use_dev(M.L[0].dev);
     Work& W = dev_work(g_cur);
     ExpertCache& EC = dev_cache(g_cur);
+    dev_cache(0).kv_rows(pos0 + T);
 
     // Embed and norm all T tokens in sub-chunks of <= W.Tm
     {
@@ -4707,10 +4794,14 @@ static MeasSnap meas_take() {
 }
 static void meas_print(const char* tag, const MeasSnap& a, const MeasSnap& b, int fw, int pos) {
     const double n = std::max(1, fw);
-    std::printf("%s t0=%.3f t1=%.3f pos=%d fw=%d ms=%.1f tok_s=%.2f hits=%.1f miss=%.1f cpu=%.1f lazy=%.2f wait=%.2f skip=%.2f mskip=%.2f tl:", tag,
+    std::printf("%s t0=%.3f t1=%.3f pos=%d fw=%d ms=%.1f tok_s=%.2f hits=%.1f miss=%.1f cpu=%.1f lazy=%.2f wait=%.2f skip=%.2f mskip=%.2f slots=%d tl:", tag,
                 a.wall, b.wall, pos, fw, (b.t - a.t) * 1e3, fw / std::max(1e-9, b.t - a.t), (b.hits - a.hits) / n,
                 (b.misses - a.misses) / n, (b.cpu - a.cpu) / n, (b.lazy - a.lazy) / n, (b.wait - a.wait) / n,
-                (b.skips - a.skips) / n, (b.mskip - a.mskip) / n);
+                (b.skips - a.skips) / n, (b.mskip - a.mskip) / n, [] {
+                    int v = 0;
+                    for (const auto& P : dev_cache(0).pools) v += P.live();
+                    return v;
+                }());
     for (int i = 0; i < 8; ++i) std::printf(" %.2f", (b.tl[i] - a.tl[i]) * 1e3 / n);
     std::printf("\n");
 }
@@ -5741,6 +5832,27 @@ int main(int argc, char** argv) {
         std::printf("  pool %zu: %d slots of %.1f MiB (%.1f GiB, %d layers)\n", p, EC.pools[p].n_slots,
                     EC.pools[p].slot_bytes / 1048576.0,
                     (double) EC.pools[p].n_slots * EC.pools[p].slot_bytes / 1073741824.0, EC.pools[p].n_layers);
+    if (getenv("IK2_KV_LEND") && std::atoi(getenv("IK2_KV_LEND")) && d == 0) {
+        if (n_gpu != 1 || g_parallel > 1 || g_kv_managed || g_fast_want || g_tp || g_ep || drafter)
+            die("IK2_KV_LEND needs one GPU with the expert cache (not the resident path), one slot, no drafter");
+        std::vector<uint8_t*> arrs;
+        size_t arr_bytes = 0;
+        const size_t row_bytes = KD * (g_kv_fp8 ? 1 : 2);
+        for (const auto& Vi : M.V) {
+            if (M.L[Vi.l].sliding) continue;
+            arrs.push_back(g_kv_fp8 ? Vi.kc8 : (uint8_t*) Vi.kc);
+            arrs.push_back(g_kv_fp8 ? Vi.vc8 : (uint8_t*) Vi.vc);
+            arr_bytes = (size_t) Vi.kv_cap * row_bytes;
+        }
+        int p = -1;   // (the pool of the most layers: the others' slots are larger)
+        for (size_t i = 0; i < EC.pools.size(); ++i)
+            if (p < 0 || EC.pools[i].n_layers > EC.pools[p].n_layers) p = (int) i;
+        if (p >= 0 && !arrs.empty()) EC.kv_lend_init(p, arrs, arr_bytes, row_bytes, 256);
+        EC.kv_rows(0);
+        std::printf("  IK2_KV_LEND: up to %d more slots in pool %d, in the unused ends of %zu K / V arrays of %.0f MiB "
+                    "(%d fewer every %zu tokens of context)\n", EC.kv.levels * EC.kv.n_arr, p, arrs.size(),
+                    arr_bytes / 1048576.0, EC.kv.n_arr, EC.kv.pool >= 0 ? EC.pools[p].slot_bytes / row_bytes : (size_t) 0);
+    }
     const char* wf = getenv("IK2_WARM");
     if ((wf && *wf) || g_ep) {   // the cache filled with the most picked experts (IK2_POP_OUT's file or all owned for EP)
         FILE* in = (wf && *wf) ? std::fopen(wf, "rb") : nullptr;
@@ -6921,6 +7033,7 @@ int main(int argc, char** argv) {
             const double t0 = now();
             const int pos = (int) p.ids.size();
             const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
+            dev_cache(0).kv_rows(pos);   // (IK2_KV_LEND: the rows copied back below)
             for (auto& sn : snaps) sn.pos = -1;   // (they were the other conversation's)
             Snap& sn = snaps[snap_next];
             snap_next = (snap_next + 1) % (int) snaps.size();
@@ -7740,6 +7853,11 @@ int main(int argc, char** argv) {
                     "admissions refused\n", g_cpu_batches, g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3,
                     (unsigned long long) g_n_lazy_copies, (unsigned long long) g_n_miss_skip,
                     (unsigned long long) dev_cache(0).admission_skips);
+    if (dev_cache(0).kv.pool >= 0) {
+        const auto& kv = dev_cache(0).kv;
+        std::printf("IK2_KV_LEND: %d borrowed slots in use at the end; %llu taken back, %llu given\n", kv.on * kv.n_arr,
+                    (unsigned long long) kv.taken, (unsigned long long) kv.given);
+    }
     if (g_tl.on && g_tl.tokens)
         std::printf("timeline, ms a token over %ld tokens: launching attention %.2f, waiting for the GPU %.2f, cache "
                     "decisions and copies %.2f, launching the hits %.2f, waiting for the CPU lane %.2f, tail %.2f, "

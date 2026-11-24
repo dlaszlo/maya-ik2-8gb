@@ -1349,8 +1349,14 @@ class StrataEngine:
             hist = self.stat_history = collections.deque(maxlen=120)
         hist.append(st)
 
+    def request_sampling_keys(self, sampling: dict) -> str:
+        # maya-ik2 accepts wider candidate sets than the older engines. Preserve its
+        # requested top_k (including zero); the engine applies its own 1000-token cap.
+        limit = None if getattr(self, "info", {}).get("engine_kind") == "ik2" else 64
+        return self.sampling_keys(sampling, top_k_limit=limit)
+
     @staticmethod
-    def sampling_keys(sampling: dict) -> str:
+    def sampling_keys(sampling: dict, *, top_k_limit: int | None = 64) -> str:
         keys = ""
         t = sampling.get("temperature")
         tb, te = sampling.get("_think_budget"), sampling.get("_think_end")   # the run config's (StrataService.run)
@@ -1408,8 +1414,8 @@ class StrataEngine:
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
-            # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+            # None delegates the range to the engine; legacy engines retain their 64-candidate behavior.
+            keys += f" top_k={tk if top_k_limit is None or 1 <= tk <= top_k_limit else top_k_limit}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -1502,8 +1508,8 @@ class StrataEngine:
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        head = f"GENI {int(max_new)}{self.request_sampling_keys(sampling or {})} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.request_sampling_keys(sampling or {})}"
         try:
             turn_mark("gen_start")
             if prompt_memo_on():
@@ -1704,7 +1710,7 @@ class StrataEngine:
         self._tls.rid = rid
         self.progress = None
         self.prefill_tok_s_mean = None
-        keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
+        keys = self.request_sampling_keys(sampling or {}) + f" rid={rid}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         done = False
         try:

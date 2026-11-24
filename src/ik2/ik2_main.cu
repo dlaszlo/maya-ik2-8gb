@@ -346,6 +346,15 @@ double g_lazy_fit = 0;
 // (9 KB).  A host-to-device copy of 28 KB and more - three experts' rows - is the copy engine's, where it queues
 // behind a lazy copy in flight (4.5 MB: 375 us); up to 24 KB a copy travels with the commands and does not wait.
 bool g_cpu_sum = true;
+// Experiments that change the model's arithmetic (measured against the unchanged model with IK2_FORCE and
+// IK2_LOGITS_OUT; off unless set):
+//   IK2_X_K=N           N experts a token instead of the file's expert_used_count
+//   IK2_X_LOOPS=N       the looped core run N times instead of the file's num_loops
+//   IK2_X_CACHE_BIAS=B  cache-aware routing on the token path: B added to the router's score (a sigmoid, 0 .. 1) of
+//                       every expert that is in VRAM, so that near ties go to the experts already there
+float g_x_cache_bias = 0.0f;
+float* g_x_bias_d = nullptr;
+std::vector<std::vector<float>> g_x_bias_h;   // a layer's own bias, read back once
 uint64_t g_n_lazy_copies = 0;
 cudaStream_t g_ls = nullptr;          // IK2_LAZY_STREAM=1: lazy copies on their own stream
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
@@ -3528,7 +3537,21 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
-        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        const float* route_bias = Ly.probs_b;
+        if (g_x_cache_bias > 0 && T == 1 && g_pool) {   // (IK2_X_CACHE_BIAS: the experts in VRAM ranked a little higher)
+            if (g_x_bias_h.empty()) g_x_bias_h.resize(c.n_layer);
+            if (g_x_bias_h[l].empty()) {
+                g_x_bias_h[l].resize(c.E);
+                CU(cudaMemcpy(g_x_bias_h[l].data(), Ly.probs_b, (size_t) c.E * 4, cudaMemcpyDeviceToHost));
+            }
+            if (!g_x_bias_d) g_x_bias_d = dalloc<float>((size_t) 64 * c.E);
+            float tmp_b[1024];
+            for (int e = 0; e < c.E; ++e) tmp_b[e] = g_x_bias_h[l][e] + (EC.has(l, e) ? g_x_cache_bias : 0.0f);
+            float* bd = g_x_bias_d + (size_t) (vis % 64) * c.E;
+            CU(cudaMemcpyAsync(bd, tmp_b, (size_t) c.E * 4, cudaMemcpyHostToDevice, g_s));
+            route_bias = bd;
+        }
+        k::route(W.rlog, route_bias, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         // (Q8_0 experts too with IK2_CPU_Q8=1: the last layers of unsloth's UD-Q4_K_XL)
         const bool lane_q8 = g_cpu_q8 && Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
@@ -4657,6 +4680,7 @@ int main(int argc, char** argv) {
     c.D = (int) key("attention.key_length");
     c.E = (int) key("expert_count");
     c.K = (int) key("expert_used_count");
+    if (getenv("IK2_X_K")) c.K = std::clamp(std::atoi(getenv("IK2_X_K")), 1, c.K);
     c.F = (int) key("expert_feed_forward_length");
     c.window = (int) key("attention.sliding_window");
     c.d_rel = (int) key("d_rel", "attention.relative_length");
@@ -4687,6 +4711,10 @@ int main(int argc, char** argv) {
         if (!sp || (int) sp->items.size() != c.n_visit) die("sliding_window_pattern");
         for (int l = 0; l < c.n_layer; ++l)
             c.sliding.push_back(sp->items[l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
+    }
+    if (getenv("IK2_X_LOOPS") && c.n_pass > 1) {   // (after the file's pattern is read with the file's passes)
+        c.n_pass = std::clamp(std::atoi(getenv("IK2_X_LOOPS")), 2, c.n_pass);
+        c.n_visit = c.n_layer + (c.n_pass - 1) * n_core;
     }
     // (a row of an expert is whole blocks of its type: checked per tensor below; 64 covers NVFP4 and Q8_0)
     if (c.D != 128 || c.H % c.KV || c.C % 64 || c.F % 64) die("unexpected shapes");
@@ -4790,6 +4818,7 @@ int main(int argc, char** argv) {
     g_lazy_per = getenv("IK2_LAZY_PER") ? std::atoi(getenv("IK2_LAZY_PER")) : 0;
     g_lazy_fit = getenv("IK2_LAZY_FIT_MS") ? std::atof(getenv("IK2_LAZY_FIT_MS")) * 1e-3 : 0;
     g_cpu_sum = !getenv("IK2_CPU_SUM") || std::atoi(getenv("IK2_CPU_SUM"));
+    g_x_cache_bias = getenv("IK2_X_CACHE_BIAS") ? (float) std::atof(getenv("IK2_X_CACHE_BIAS")) : 0.0f;
     if (getenv("IK2_LAZY_STREAM") && std::atoi(getenv("IK2_LAZY_STREAM")) && n_gpu == 1) {
         int lo = 0, hi = 0;
         CU(cudaDeviceGetStreamPriorityRange(&lo, &hi));

@@ -338,6 +338,15 @@ double g_cpu_busy = 0;   // the CPU lane's batches: their time in all, how many
 long g_cpu_batches = 0;
 bool g_lazy_cpu = false;   // IK2_LAZY_CPU=1: an expert still arriving from a lazy copy computed on the CPU
 int g_lazy_max = 0, g_lazy_per = 0;   // IK2_LAZY_MAX, IK2_LAZY_PER: lazy batches in flight, lazy copies a call (0: any)
+// IK2_LAZY_FIT_MS=T: a lazy copy is started only where it fits under the CPU lane's work of the same layer visit -
+// as many copies as the visit's CPU experts' time holds at T ms a copy.  A copy in flight holds up the compute
+// stream (an RTX 4060: 0.3 ms of the next visit's attention for each copy not hidden under a wait for the CPU).
+double g_lazy_fit = 0;
+// IK2_CPU_SUM=0: off.  One token's CPU-lane rows are summed with their weights on the host and go up as one row
+// (9 KB).  A host-to-device copy of 28 KB and more - three experts' rows - is the copy engine's, where it queues
+// behind a lazy copy in flight (4.5 MB: 375 us); up to 24 KB a copy travels with the commands and does not wait.
+bool g_cpu_sum = true;
+uint64_t g_n_lazy_copies = 0;
 cudaStream_t g_ls = nullptr;          // IK2_LAZY_STREAM=1: lazy copies on their own stream
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
 constexpr int kRing = 256;
@@ -347,6 +356,20 @@ void lazy_poll() {
     while (g_seq_done + 1 < g_seq_next && cudaEventQuery(g_ring[(g_seq_done + 1) % kRing]) == cudaSuccess) ++g_seq_done;
 }
 
+// IK2_TL=1 (temporary instrumentation): where the main thread's time goes in a one-token forward on the cache path
+struct Timeline {
+    bool on = false;
+    int level = 0;
+    double gpu_hits = 0;
+    double t = 0, launch_attn = 0, sync_wait = 0, decide = 0, launch_hits = 0, pool_wait = 0, tail = 0, head = 0, other = 0;
+    long tokens = 0;
+    void lap(double& acc) {
+        if (!on) return;
+        const double n = now();
+        if (t > 0) acc += n - t;
+        t = n;
+    }
+} g_tl;
 // IK2_PROF=1: the stream waited for at each phase's end, its time added to the phase (slower, but where it goes)
 bool g_prof = false;
 bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs too
@@ -3397,6 +3420,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         return;
     }
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
+    if (T == 1) g_tl.lap(g_tl.other);
     use_dev(M.L[0].dev);
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
@@ -3513,7 +3537,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         double& t_cpu = g_t_cpu_f[lane_q8 ? 1 : 0];
         const double t_up = lane_q8 ? g_t_up * (34.0 / 32.0) / (36.0 / 64.0) : g_t_up;   // (the blocks' bytes a value)
         if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
+        if (T == 1) g_tl.lap(g_tl.launch_attn);
         CU(cudaStreamSynchronize(g_s));
+        if (T == 1) g_tl.lap(g_tl.sync_wait);
         const int* top = W.route_h;
         const float* w = (const float*) (W.route_h + S);
         pop_count(l, top, S);
@@ -3798,8 +3824,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             const uint32_t stp = W.stamp;
             lazy_poll();
             double acc_up = 0, acc_cpu = 0;
-            int urgent[64], lazy[64];
-            int n_urgent = 0, n_lazy = 0;
+            int urgent[64], lazy[64], fit_cand[64];
+            int n_urgent = 0, n_lazy = 0, n_fit_cand = 0;
             for (int i = 0; i < S; ++i) {
                 const int e = top[i];
                 if (W.seen_stamp[e] == stp) {   // a second token of this call on an expert missing in it
@@ -3823,9 +3849,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     late[i] = 2, acc_cpu += t_cpu;
                     // (IK2_LAZY_MAX / IK2_LAZY_PER: at most that many lazy batches in flight and copies a call, so
                     //  a narrow link is not queued up with them; past either the expert is only computed)
-                    const bool lazy_ok = g_cpu_lazy && (g_lazy_max <= 0 || (int) (g_seq_next - 1 - g_seq_done) < g_lazy_max) &&
+                    const bool lazy_ok = g_lazy_fit <= 0 && g_cpu_lazy &&
+                                         (g_lazy_max <= 0 || (int) (g_seq_next - 1 - g_seq_done) < g_lazy_max) &&
                                          (g_lazy_per <= 0 || n_lazy < g_lazy_per);
-                    if (lazy_ok) {   // a slot for its blocks, copied in afterwards
+                    if (g_lazy_fit > 0) {   // (decided below, once the visit's CPU experts are counted)
+                        where[i] = nullptr, slot_of[i] = -1;
+                        fit_cand[n_fit_cand++] = i;
+                    } else if (lazy_ok) {   // a slot for its blocks, copied in afterwards
                         where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                         slot_of[i] = EC.last_handle;
                         lazy[n_lazy++] = i;
@@ -3844,6 +3874,22 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             int nh = 0, nw = 0;
             for (int i = 0; i < S; ++i) nh += late[i] == 0, nw += late[i] == 1;
+            if (n_fit_cand > 0) {
+                int budget = g_cpu_lazy ? (int) ((S - nh - nw) * t_cpu / g_lazy_fit) : 0;
+                if (g_lazy_per > 0) budget = std::min(budget, g_lazy_per);
+                if (g_lazy_max > 0) budget = std::min(budget, g_lazy_max - (int) (g_seq_next - 1 - g_seq_done));
+                for (int j = 0; j < n_fit_cand; ++j) {
+                    const int i = fit_cand[j];
+                    if (j < budget) {
+                        where[i] = EC.get(Ly, l, top[i], tick, cst, nullptr, false, false);
+                        slot_of[i] = EC.last_handle;
+                        lazy[n_lazy++] = i;
+                    } else {
+                        ++EC.misses;
+                    }
+                }
+            }
+            g_n_lazy_copies += n_lazy;
             for (int ui = 0; ui < n_urgent; ++ui) {
                 const int i = urgent[ui];
                 EC.copy_in(Ly, top[i], (uint8_t*) where[i], cst);
@@ -3872,6 +3918,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             int ph = 0, pm = nh, pc = nh + nw;
             ik2::cpu::ExpertJob jobs[64];
             const int n_jobs = S - nh - nw;
+            if (T == 1) g_tl.lap(g_tl.decide);
             const double tc0 = now();
             for (int i = 0; i < S; ++i) {
                 const int e = top[i], p = late[i] == 2 ? pc++ : late[i] ? pm++ : ph++;
@@ -3925,6 +3972,19 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     gtok[(size_t) g * k::kGroupMax + gn[g]] = i / c.K;
                     grow[(size_t) g * k::kGroupMax + gn[g]] = id[i];
                     ++gn[g];
+                }
+            }
+            // (IK2_CPU_SUM: the CPU lane's rows are one row, their weights the host's - see g_cpu_sum)
+            const bool cpu_sum = g_cpu_sum && T == 1 && n_jobs > 1;
+            float wt_cpu[64];
+            if (cpu_sum) {
+                bool first = true;
+                for (int i = 0; i < S; ++i) {
+                    if (late[i] != 2) continue;
+                    wt_cpu[id[i] - nh - nw] = wt[i];
+                    id[i] = nh + nw;
+                    wt[i] = first ? 1.0f : 0.0f;
+                    first = false;
                 }
             }
             g_pf.lap(g_pf.upload);
@@ -3981,12 +4041,26 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 k::experts_down(pb + p0, n, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16 + (size_t) p0 * F, C, F,
                                 W.y32 + (size_t) p0 * C, g_s);
             }
+            if (T == 1) g_tl.lap(g_tl.launch_hits);
+            if (T == 1 && g_tl.level >= 2) {   // (IK2_TL=2: how long the GPU's own experts of this visit take)
+                CU(cudaStreamSynchronize(g_s));
+                g_tl.lap(g_tl.gpu_hits);
+            }
             if (n_jobs > 0) {
                 g_pool->wait();
+                if (T == 1) g_tl.lap(g_tl.pool_wait);
                 g_cpu_busy += now() - tc0, ++g_cpu_batches;
                 t_cpu = 0.9 * t_cpu + 0.1 * (now() - tc0) / n_jobs;
-                CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) n_jobs * C * 4, cudaMemcpyHostToDevice,
-                                   g_s));
+                if (cpu_sum) {
+                    for (int c2 = 0; c2 < C; ++c2) yh[c2] *= wt_cpu[0];
+                    for (int j = 1; j < n_jobs; ++j) {
+                        const float* yj = yh + (size_t) j * C;
+                        const float wj = wt_cpu[j];
+                        for (int c2 = 0; c2 < C; ++c2) yh[c2] += wj * yj[c2];
+                    }
+                }
+                CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) (cpu_sum ? 1 : n_jobs) * C * 4,
+                                   cudaMemcpyHostToDevice, g_s));
             }
             k::moe_combine_f32(W.y32, pid, pwt, T, c.K, C, W.tmp, false, g_s);
             g_pf.lap(g_pf.experts);
@@ -3994,6 +4068,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             g_pf.lap(g_pf.rest);
+            if (T == 1) g_tl.lap(g_tl.tail);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -4002,6 +4077,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    if (T == 1) g_tl.lap(g_tl.head), ++g_tl.tokens;
 #undef W
 #undef EC
 }
@@ -4532,6 +4608,8 @@ int main(int argc, char** argv) {
         else die("unknown argument " + a);
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+    g_tl.on = getenv("IK2_TL") && std::atoi(getenv("IK2_TL"));
+    g_tl.level = getenv("IK2_TL") ? std::atoi(getenv("IK2_TL")) : 0;
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
@@ -4710,6 +4788,8 @@ int main(int argc, char** argv) {
     g_lazy_cpu = getenv("IK2_LAZY_CPU") && std::atoi(getenv("IK2_LAZY_CPU"));
     g_lazy_max = getenv("IK2_LAZY_MAX") ? std::atoi(getenv("IK2_LAZY_MAX")) : 0;
     g_lazy_per = getenv("IK2_LAZY_PER") ? std::atoi(getenv("IK2_LAZY_PER")) : 0;
+    g_lazy_fit = getenv("IK2_LAZY_FIT_MS") ? std::atof(getenv("IK2_LAZY_FIT_MS")) * 1e-3 : 0;
+    g_cpu_sum = !getenv("IK2_CPU_SUM") || std::atoi(getenv("IK2_CPU_SUM"));
     if (getenv("IK2_LAZY_STREAM") && std::atoi(getenv("IK2_LAZY_STREAM")) && n_gpu == 1) {
         int lo = 0, hi = 0;
         CU(cudaDeviceGetStreamPriorityRange(&lo, &hi));
@@ -7440,8 +7520,16 @@ int main(int argc, char** argv) {
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
     if (g_pool && g_cpu_batches)
-        std::printf("CPU lane batches: %ld, %.1f us each, Q8_0 %.2f ms a job\n", g_cpu_batches,
-                    g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3);
+        std::printf("CPU lane batches: %ld, %.1f us each, Q8_0 %.2f ms a job; %llu lazy copies\n", g_cpu_batches,
+                    g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3, (unsigned long long) g_n_lazy_copies);
+    if (g_tl.on && g_tl.tokens)
+        std::printf("timeline, ms a token over %ld tokens: launching attention %.2f, waiting for the GPU %.2f, cache "
+                    "decisions and copies %.2f, launching the hits %.2f, waiting for the CPU lane %.2f, tail %.2f, "
+                    "head %.2f, between tokens %.2f, the GPU's experts (IK2_TL=2) %.2f\n",
+                    g_tl.tokens, g_tl.launch_attn * 1e3 / g_tl.tokens, g_tl.sync_wait * 1e3 / g_tl.tokens,
+                    g_tl.decide * 1e3 / g_tl.tokens, g_tl.launch_hits * 1e3 / g_tl.tokens,
+                    g_tl.pool_wait * 1e3 / g_tl.tokens, g_tl.tail * 1e3 / g_tl.tokens, g_tl.head * 1e3 / g_tl.tokens,
+                    g_tl.other * 1e3 / g_tl.tokens, g_tl.gpu_hits * 1e3 / g_tl.tokens);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);

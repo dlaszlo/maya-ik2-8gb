@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace ik2::cpu {
@@ -32,64 +33,6 @@ bool avx2_ok() {
 
 bool available() {
     return avx512_ok() || avx2_ok();
-}
-
-Pool::Pool(int n) {
-    for (int i = 0; i < n; ++i)
-        th_.emplace_back([this]() {
-            for (;;) {
-                std::function<void()> f;
-                {
-                    // spin a while before sleeping: an expert's chunks come ~1 ms apart, a wake-up costs tens of us
-                    std::unique_lock<std::mutex> lk(m_, std::defer_lock);
-                    for (int spin = 0;; ++spin) {
-                        lk.lock();
-                        if (stop_ || !q_.empty()) break;
-                        if (spin > 20000) {
-                            cv_.wait(lk, [this]() { return stop_ || !q_.empty(); });
-                            break;
-                        }
-                        lk.unlock();
-                        _mm_pause();
-                    }
-                    if (stop_ && q_.empty()) return;
-                    f = std::move(q_.front());
-                    q_.pop_front();
-                }
-                f();
-                {
-                    std::lock_guard<std::mutex> lk(m_);
-                    if (--pending_ == 0) done_.notify_all();
-                }
-            }
-        });
-}
-Pool::~Pool() {
-    {
-        std::lock_guard<std::mutex> lk(m_);
-        stop_ = true;
-    }
-    cv_.notify_all();
-    for (auto& t : th_) t.join();
-}
-void Pool::post(std::function<void()> f) {
-    {
-        std::lock_guard<std::mutex> lk(m_);
-        q_.push_back(std::move(f));
-        ++pending_;
-    }
-    cv_.notify_one();
-}
-void Pool::wait() {
-    std::unique_lock<std::mutex> lk(m_, std::defer_lock);
-    for (int spin = 0; spin < 200000; ++spin) {   // (the caller spins too: the work is short)
-        lk.lock();
-        if (pending_ == 0) return;
-        lk.unlock();
-        _mm_pause();
-    }
-    lk.lock();
-    done_.wait(lk, [this]() { return pending_ == 0; });
 }
 
 namespace {
@@ -312,34 +255,151 @@ void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* 
     nvfp4_rows_scalar(W, K, r0, r1, x, out);
 }
 
-void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float ucap) {
-    job->gu.resize((size_t) 2 * F);
-    job->h.resize(F);
-    const int n = std::max(1, pool.size());
-    auto down = [&pool, job, C, F, n]() {
-        for (int c = 0; c < n; ++c) {
-            const int r0 = (int) ((long) C * c / n), r1 = (int) ((long) C * (c + 1) / n);
-            pool.post([job, F, r0, r1]() {
-                (job->q8 ? q8_0_rows : nvfp4_rows)(job->down, F, r0, r1, job->h.data(), job->y + r0);
-            });
-        }
-    };
-    job->left = n;   // the chunks of gate and up rows, each with its rows' activation
-    for (int c = 0; c < n; ++c) {
-        const int r0 = (int) ((long) F * c / n), r1 = (int) ((long) F * (c + 1) / n);
-        pool.post([job, C, F, gcap, ucap, r0, r1, down]() {
-            auto rows = job->q8 ? q8_0_rows : nvfp4_rows;
-            float* g = job->gu.data();
-            float* u = job->gu.data() + F;
-            rows(job->gate, C, r0, r1, job->x, g + r0);
-            rows(job->up, C, r0, r1, job->x, u + r0);
-            for (int i = r0; i < r1; ++i) {
-                const float gs = g[i] * job->sg, us = u[i] * job->su;
-                job->h[i] = gcap * std::tanh(gs / gcap) * (1.0f / (1.0f + std::exp(-gs))) * ucap * std::tanh(us / ucap);
+namespace {
+constexpr int kRowsA = 32, kRowsB = 64;   // rows a block: of gate and up (with their activation), of down
+
+// An idle worker between two batches.  Spinning on PAUSE, six workers take the core's other thread and the turbo
+// from the thread that drives the GPU (measured: the batches 10% shorter, the rest of a token as much longer).
+// UMWAIT (WAITPKG: Alder Lake, Sapphire Rapids and later) waits in C0.2 until the epoch's cache line is written,
+// which wakes it within a microsecond; the OS caps one wait (umwait_control/max_time, ~30 us).
+bool waitpkg_ok() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool ok = __builtin_cpu_supports("waitpkg");
+    return ok;
+#else
+    return false;
+#endif
+}
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("waitpkg")))
+void umwait_epoch(const std::atomic<uint64_t>* epoch, uint64_t seen) {
+    _umonitor((void*) epoch);
+    if (epoch->load(std::memory_order_acquire) != seen) return;
+    _umwait(0, __rdtsc() + 200000);
+}
+#endif
+}
+
+Pool::Pool(int n) {
+    for (int i = 0; i < n; ++i)
+        th_.emplace_back([this]() {
+            uint64_t seen = 0;
+            for (;;) {
+                // spin a while before sleeping: an expert's rows come ~1 ms apart, a wake-up costs tens of us
+                const bool uw = waitpkg_ok();
+                for (int spin = 0; epoch_.load(std::memory_order_acquire) == seen && !stop_.load(); ++spin) {
+                    if (spin < (uw ? 128 : 1 << 16)) {   // (~4 ms either way)
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+                        if (uw) {
+                            umwait_epoch(&epoch_, seen);
+                            continue;
+                        }
+#endif
+                        _mm_pause();
+                        continue;
+                    }
+                    std::unique_lock<std::mutex> lk(m_);
+                    ++sleepers_;
+                    cv_.wait(lk, [&]() { return epoch_.load() != seen || stop_.load(); });
+                    --sleepers_;
+                }
+                if (stop_.load()) return;
+                seen = epoch_.load();
+                // (active before the jobs are looked at: wait() empties the list, then waits for no one active)
+                active_.fetch_add(1);
+                work();
+                active_.fetch_sub(1);
             }
-            if (--job->left == 0) down();   // the last chunk: down's rows, which need all of h
         });
+}
+Pool::~Pool() {
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        stop_ = true;
     }
+    cv_.notify_all();
+    for (auto& t : th_) t.join();
+}
+
+void Pool::add(ExpertJob* job, int C, int F, float gcap, float ucap) {
+    const int j = n_jobs_.load();
+    if (j >= kMaxJobs) std::abort();
+    if (F > scratch_F_) {   // (the first expert, or a wider model: no batch is in flight unless j > 0)
+        if (j > 0) std::abort();
+        scratch_.assign((size_t) kMaxJobs * 3 * F, 0.0f);
+        scratch_F_ = F;
+    }
+    job->C = C, job->F = F, job->gcap = gcap, job->ucap = ucap;
+    job->g = scratch_.data() + (size_t) j * 3 * scratch_F_;
+    job->u = job->g + scratch_F_;
+    job->h = job->u + scratch_F_;
+    job->n_a = (F + kRowsA - 1) / kRowsA, job->n_b = (C + kRowsB - 1) / kRowsB;
+    job->next_a = 0, job->done_a = 0, job->next_b = 0, job->done_b = 0;
+    jobs_[j] = job;
+    left_.fetch_add(1);
+    n_jobs_.store(j + 1, std::memory_order_release);
+    epoch_.fetch_add(1, std::memory_order_release);
+    bool wake;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        wake = sleepers_ > 0;
+    }
+    if (wake) cv_.notify_all();
+}
+
+// The posted experts' row blocks until none is left to take: gate's and up's rows with their activation, then -
+// once all of an expert's activation is there - down's rows.
+void Pool::work() {
+    for (;;) {
+        const int n = n_jobs_.load(std::memory_order_acquire);
+        bool took = false, pending = false;
+        for (int j = 0; j < n; ++j) {
+            ExpertJob& J = *jobs_[j];
+            const auto rows = J.q8 ? q8_0_rows : nvfp4_rows;
+            while (J.next_a.load(std::memory_order_relaxed) < J.n_a) {
+                const int i = J.next_a.fetch_add(1);
+                if (i >= J.n_a) break;
+                const int r0 = i * kRowsA, r1 = std::min(J.F, r0 + kRowsA);
+                rows(J.gate, J.C, r0, r1, J.x, J.g + r0);
+                rows(J.up, J.C, r0, r1, J.x, J.u + r0);
+                for (int r = r0; r < r1; ++r) {
+                    const float gs = J.g[r] * J.sg, us = J.u[r] * J.su;
+                    J.h[r] = J.gcap * std::tanh(gs / J.gcap) * (1.0f / (1.0f + std::exp(-gs))) * J.ucap *
+                             std::tanh(us / J.ucap);
+                }
+                J.done_a.fetch_add(1, std::memory_order_release);
+                took = true;
+            }
+            if (J.done_a.load(std::memory_order_acquire) < J.n_a) {   // (its last blocks are still another thread's)
+                pending = true;
+                continue;
+            }
+            while (J.next_b.load(std::memory_order_relaxed) < J.n_b) {
+                const int i = J.next_b.fetch_add(1);
+                if (i >= J.n_b) break;
+                const int r0 = i * kRowsB, r1 = std::min(J.C, r0 + kRowsB);
+                rows(J.down, J.F, r0, r1, J.h, J.y + r0);
+                if (J.done_b.fetch_add(1, std::memory_order_release) + 1 == J.n_b) left_.fetch_sub(1);
+                took = true;
+            }
+        }
+        if (took) continue;
+        if (!pending) return;
+        _mm_pause();
+    }
+}
+
+void Pool::wait() {
+    if (n_jobs_.load() == 0) return;
+    // (the caller takes no rows: an expert's megabytes through its caches and the launches after this run cold -
+    //  measured, the batches 13% shorter either way but the token no faster with the caller's help)
+    while (left_.load(std::memory_order_acquire) != 0) _mm_pause();
+    n_jobs_.store(0);
+    while (active_.load() != 0) _mm_pause();   // no thread still looks at the jobs: they are the caller's again
+}
+
+void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float ucap) {
+    pool.add(job, C, F, gcap, ucap);
 }
 
 }  // namespace ik2::cpu

@@ -8,8 +8,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -19,22 +17,31 @@ namespace ik2::cpu {
 /// Whether this CPU (and OS) runs the AVX-512 or the AVX2 kernels.
 bool available();
 
-/// Worker threads taking tasks in order; wait(): until every task posted so far (and the ones they posted) is done.
+struct ExpertJob;
+
+/// Worker threads sharing the rows of the experts posted (post_expert), a few rows a time from one counter an expert,
+/// so no thread is left with a share of its own to finish; wait(): until every expert posted so far is done.  At most kMaxJobs experts between two wait()s.
 class Pool {
 public:
+    static constexpr int kMaxJobs = 64;
     explicit Pool(int n);
     ~Pool();
-    void post(std::function<void()> f);
+    void add(ExpertJob* job, int C, int F, float gcap, float ucap);
     void wait();
     int size() const { return (int) th_.size(); }
 
 private:
+    void work();
     std::vector<std::thread> th_;
-    std::deque<std::function<void()>> q_;
+    ExpertJob* jobs_[kMaxJobs] = {};
+    std::atomic<int> n_jobs_{0}, left_{0}, active_{0};
+    alignas(64) std::atomic<uint64_t> epoch_{0};   // (a line of its own: idle workers wait for a write to it)
+    alignas(64) std::atomic<bool> stop_{false};
+    std::vector<float> scratch_;   // gate's, up's sums and the activation of every job, [kMaxJobs][3][F]
+    int scratch_F_ = 0;
     std::mutex m_;
-    std::condition_variable cv_, done_;
-    int pending_ = 0;
-    bool stop_ = false;
+    std::condition_variable cv_;
+    int sleepers_ = 0;
 };
 
 /// out[r - r0] = W[r] . x for rows r0 .. r1 - 1 of an NVFP4 matrix (rows of K values, K % 64 == 0).
@@ -51,8 +58,11 @@ struct ExpertJob {
     float sg = 1.0f, su = 1.0f;
     bool q8 = false;   // the three matrices are Q8_0 instead of NVFP4
     float* y = nullptr;
-    std::vector<float> gu, h;
-    std::atomic<int> left{0};
+    // (the pool's: the shapes, its scratch rows and the row blocks taken and done of gate / up and of down)
+    int C = 0, F = 0, n_a = 0, n_b = 0;
+    float gcap = 0.0f, ucap = 0.0f;
+    float *g = nullptr, *u = nullptr, *h = nullptr;
+    std::atomic<int> next_a{0}, done_a{0}, next_b{0}, done_b{0};
 };
 void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float ucap);
 

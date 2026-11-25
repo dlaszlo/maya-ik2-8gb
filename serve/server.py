@@ -201,6 +201,11 @@ QUEUE_LOG_S = 5.0
 # A queued request's keep-alive while it waits for its first turn (#483): often enough for any stream-idle timeout,
 # seldom enough to cost nothing (queue_ping_seconds: MAYA_QUEUE_PING_S sets another).
 QUEUE_PING_S = 2.0
+# ... and an answer's keep-alive while it is being written: tokens can come for minutes with nothing of them for the
+# client - a tool call held back (the loop guard's `pending`, a shape the parser reads only whole), an answer held
+# for its JSON or its validation - and a client with a stream-idle timeout then dropped an answer that was on its way
+# (stream_ping_seconds: MAYA_STREAM_PING_S sets another).
+STREAM_PING_S = 10.0
 # The queue watchdog (Service.start_queue_watch): how often it looks, the age at which the first waiter means the
 # queue has stopped moving, and how often it says so again while it stays that way.
 QUEUE_TICK_S = 15.0
@@ -419,6 +424,14 @@ def queue_ping_seconds() -> float:
         return max(0.01, float(os.environ.get("MAYA_QUEUE_PING_S", "") or QUEUE_PING_S))
     except ValueError:
         return QUEUE_PING_S
+
+
+def stream_ping_seconds() -> float:
+    """MAYA_STREAM_PING_S: how often an answer that is being written sends a keep-alive (STREAM_PING_S)."""
+    try:
+        return max(0.01, float(os.environ.get("MAYA_STREAM_PING_S", "") or STREAM_PING_S))
+    except ValueError:
+        return STREAM_PING_S
 
 
 def fair_slice_seconds() -> float:
@@ -4026,6 +4039,10 @@ class Service:
                 stat.first_token = now
                 self.current_requests.add(stat)
             stat.note(now, n)                           # this request's window over the last RATE_WINDOW_S
+            if s.get("phase") == "reading the prompt":
+                # a token came, so the prompt is read: until an event names what is being written (a call the parser
+                # reads only whole gives none before its end), the phase is no more than that
+                s["phase"] = "generating"
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -4744,14 +4761,23 @@ class Service:
                 answered = bool(pre_events)             # any answer (text or a call) went out yet
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
+                # the keep-alive while the answer is written (STREAM_PING_S): a ping every that often, whatever events
+                # went out meanwhile - which of them reach the client is not known here (a stream holds text back for
+                # its JSON or its validation, an MCP call's arguments stay on the server), and a comment line too many
+                # costs nothing.  The engine's own heartbeats count: after one, the next is due that much later
+                ping_every, pinged = stream_ping_seconds(), time.monotonic()
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
                             pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            pinged = time.monotonic()
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
+                        if t is not LOOP_STOP and time.monotonic() - pinged >= ping_every:
+                            pinged = time.monotonic()
+                            yield "ping", None
                         if t is LOOP_STOP:              # the loop guard ended the answer (a loop that persisted)
                             finish = "stop"
                             if held:
@@ -6951,9 +6977,10 @@ def make_handler(svc: Service):
         def _stream_job(self, job: StreamJob, n: int):
             """A StreamJob's chunks from index n as SSE until it completes; a reader that goes away leaves it running."""
             job.reader(True)
+            every = stream_ping_seconds()                # (its chunks carry no heartbeats: each reader keeps its own time)
             try:
                 while True:
-                    items, done = job.wait(n, 10.0)
+                    items, done = job.wait(n, every)
                     if not items and not done:
                         self.wfile.write(b": keep-alive\n\n")
                     for c in items:
@@ -7062,7 +7089,7 @@ class Server(ThreadingHTTPServer):
 SERVER_ENV = ("MAYA_ENGINE_STALL_S", "MAYA_REQUEST_QUIET_S", "MAYA_DRAIN_S", "MAYA_HTTP_BACKLOG",
               "MAYA_MAX_BODY_MIB", "MAYA_FAIR_SLICE_S", "MAYA_DS4_KEEP_THINKING",
               "MAYA_SERVER_LOG", "MAYA_GLM_THINK_RESERVE", "MAYA_LOOP_GUARD", "MAYA_QUEUE_PING_S",
-              "MAYA_UPDATE_CHECK", "MAYA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
+              "MAYA_STREAM_PING_S", "MAYA_UPDATE_CHECK", "MAYA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
     tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
 
 

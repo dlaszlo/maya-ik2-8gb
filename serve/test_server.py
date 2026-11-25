@@ -2717,6 +2717,61 @@ class QueuedKeepAlives(GoneClients):
         first.close()
 
 
+class WrittenKeepAlives(unittest.TestCase):
+    """An answer that is being written sends SSE keep-alive comments too (every MAYA_STREAM_PING_S): tokens can come
+    for minutes with nothing of them for the client - here an answer held for its JSON (response_format), elsewhere a
+    tool call held to its end - and a client with a stream-idle timeout dropped an answer that was on its way.  The
+    answer is the same, the comments stand between its events, and a request that is not streamed sees none."""
+    VALUE = "".join(random.Random(483).choices(string.ascii_lowercase, k=600))
+
+    def setUp(self):
+        self.env = unittest.mock.patch.dict(os.environ, {"MAYA_STREAM_PING_S": "0.05"})
+        self.env.start()
+        tok = ByteTokenizer()
+        self.svc = Service(MockEngine(tok, '</think>\n\n{"v": "%s"}' % self.VALUE, max_context=CTX, delay_s=0.001), tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.env.stop()
+
+    def post(self, **more):
+        body = {"model": "m", "max_tokens": 2000, "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {"type": "json_object"}, **more}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode()
+
+    def test_keep_alives_while_the_answer_is_held(self):
+        raw = self.post(stream=True)
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"), raw[-60:])
+        blocks = raw[:-2].split("\n\n")
+        alive = [i for i, b in enumerate(blocks) if b == ": keep-alive"]
+        self.assertGreaterEqual(len(alive), 5, blocks[:3])                # ~0.7 s of tokens, one every 0.05 s
+        chunks = [json.loads(b[6:]) for b in blocks if b not in (": keep-alive", "data: [DONE]")]   # (every other block: an event, whole)
+        text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+        self.assertEqual(json.loads(text), {"v": self.VALUE})
+        at = next(i for i, b in enumerate(blocks) if self.VALUE in b)
+        self.assertGreaterEqual(sum(1 for i in alive if i < at), 5)       # they came while it was written
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_not_streamed_the_same_answer(self):
+        out = json.loads(self.post())
+        self.assertEqual(json.loads(out["choices"][0]["message"]["content"]), {"v": self.VALUE})
+
+    def test_the_setting(self):
+        from serve.server import STREAM_PING_S, stream_ping_seconds
+        self.assertEqual(stream_ping_seconds(), 0.05)
+        for value, want in (("", STREAM_PING_S), ("x", STREAM_PING_S), ("0", 0.01), ("3", 3.0)):
+            with unittest.mock.patch.dict(os.environ, {"MAYA_STREAM_PING_S": value}):
+                self.assertEqual(stream_ping_seconds(), want, value)
+        self.assertEqual(STREAM_PING_S, 10.0)
+
+
 @unittest.skipIf(os.name == "nt", "a shell script stands in for the engine")
 class FailedRestartKeepsContext(unittest.TestCase):
     """#351: an engine that died and could not start again (a GPU that fell off the bus) left max_context 0, and every

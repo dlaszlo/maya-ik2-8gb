@@ -1367,19 +1367,32 @@ class InklingRewriter:
     tool-call form with JSON values).  The model writes typed segments: <|content_thinking|> opens reasoning
     (THINK_AGAIN), <|content_text|> (and the tool-error / text-invoke kinds) opens answer text (</think> while
     reasoning is open), and a tool call is <|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}
-    <|end_message|>, which goes out whole at its end as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..
-    </tool_call> with V JSON.  What stands between segments (the tool's name after <|message_model|>, <|end_message|>)
-    is dropped.  A mark split across deltas is held until it is whole."""
+    <|end_message|>, which goes out as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..</tool_call> with V
+    JSON.  What stands between segments (the tool's name after <|message_model|>, <|end_message|>) is dropped.  A mark
+    split across deltas is held until it is whole.
+
+    The call goes out whole at its end, or - `live` (the parser's stream_tools) - as it is written (_live): held to
+    its end, a call that writes a whole file as its arguments left the parser with no event for minutes (thousands of
+    tokens: no tool_start, no status, no byte for a streaming client)."""
 
     MARKS = (INK_THINK, INK_TEXT, INK_CALL, INK_MODEL, INK_END, INK_EOS) + INK_OTHER_TEXT
 
-    def __init__(self, thinking: bool = True):
+    def __init__(self, thinking: bool = True, live: bool = False):
         self.buf = ""
         self.mode = "lead"           # lead (before any segment) | think | text | name | call | between
         self.open = thinking         # the parser is in its reasoning state (it starts there when thinking)
         self.name = ""
         self.body = ""
         self.repaired = 0            # calls read from the loose shapes (_loose)
+        self.live = live
+        self._reset_live()
+
+    def _reset_live(self):
+        # the call being streamed (_live): how far its body is read (lp), where in it (ls: head, before the opening
+        # is read | held, a shape that only reads whole | key0 | key | colon | value | str | other | next | tail |
+        # broken), and what went out - the name (None: nothing yet), the pairs, whether a string value is open
+        self.ls, self.lp, self.lname, self.largs, self.lstr = "head" if self.live else "held", 0, None, {}, False
+        self.lkey, self.lstart, self.ldepth, self.lquote, self.lesc = "", 0, 0, False, False
 
     def feed(self, text: str) -> str:
         self.buf += text
@@ -1404,7 +1417,7 @@ class InklingRewriter:
             return ""
         if self.mode == "call":
             self.body += s
-            return ""
+            return self._live()
         if self.mode == "lead":      # (no segment opened: a model that answers plainly)
             self.mode = "text" if s.strip() else "lead"
             return (self._close() + s) if self.mode == "text" else ""
@@ -1417,32 +1430,37 @@ class InklingRewriter:
         return ""
 
     def _mark(self, m: str) -> str:
+        if m in (INK_END, INK_EOS):
+            out = self._call() if self.mode == "call" else ""
+            self.mode = "between"      # <|end_message|> / the end of sampling: the segment is over
+            return out
+        # a call that was announced (_live) and never got its <|end_message|> ends at the next segment's mark: the
+        # parser is inside it, and would take that segment for the call's text
+        out = self._call() if self.mode == "call" and self.lname is not None else ""
         if m == INK_THINK:
             self.mode = "think"
             if self.open:
-                return ""
+                return out
             self.open = True
-            return THINK_AGAIN
+            return out + THINK_AGAIN
         if m == INK_TEXT or m in INK_OTHER_TEXT:
             self.mode = "text"
-            return self._close()
+            return out + self._close()
         if m == INK_MODEL:
             self.mode, self.name = "name", ""
-            return ""
-        if m == INK_CALL:
-            self.mode, self.body = "call", ""
-            return ""
-        out = self._call() if self.mode == "call" else ""
-        self.mode = "between"          # <|end_message|> / the end of sampling: the segment is over
+            return out
+        self.mode, self.body = "call", ""   # (INK_CALL)
+        self._reset_live()
         return out
 
     def finish(self) -> str:
         """The end of the answer: a mark's partial text held back is text; a call still open goes out as far as it is
-        whole (an unfinished one as its text)."""
+        whole (an unfinished one as its text - one already announced, _live, is the parser's to close: the output
+        ended inside it)."""
         rest, self.buf = self.buf, ""
         out = self._text(rest)
         if self.mode == "call":
-            out += self._call()
+            out += self._call(ended=True)
             self.mode = "between"
         return out
 
@@ -1478,22 +1496,160 @@ class InklingRewriter:
                 return name, args
         return None
 
-    def _call(self) -> str:
+    def _read(self):
+        """(name, args, repaired) of the whole call body - repaired: read from one of the loose shapes - or None when
+        it is not a call that can be read."""
         try:
             j = json.loads(self.body)
             name = (j.get("name") if isinstance(j, dict) else None) or self.name.strip()
             args = (j.get("args") if isinstance(j, dict) else None) or {}
-            if not name or not isinstance(args, dict):
+            if not name or not isinstance(name, str) or not isinstance(args, dict):
                 raise ValueError(self.body)
+            return name, args, False
         except ValueError:
-            loose = self._loose()
+            try:
+                loose = self._loose()
+            except ValueError:       # (a name with an escape JSON has not: no call - it raised, and failed the answer)
+                loose = None
             if loose is None or not (loose[0] or self.name.strip()):
-                return self._close() + self.body   # (not a call the parser can read: its text, as the answer's)
-            name, args = loose[0] or self.name.strip(), loose[1]
-            self.repaired += 1
-        val = lambda v: json.dumps(v, ensure_ascii=False).replace("<", "\\u003c")   # ("<" occurs in strings only)
+                return None
+            return loose[0] or self.name.strip(), loose[1], True
+
+    @staticmethod
+    def _val(v) -> str:
+        return json.dumps(v, ensure_ascii=False).replace("<", "\\u003c")   # ("<" occurs in strings only)
+
+    def _call(self, ended: bool = False) -> str:
+        """The call's end.  `ended`: the answer ended there, with no mark after the body."""
+        got = self._read()
+        if self.lname is not None:
+            # announced, its arguments sent as they were written (_live): the call is complete when the whole body
+            # reads - as a call held to its end is read - as that very name and those very arguments
+            same = lambda a, b: json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+            if got is not None and self.ls == "tail" and got[0] == self.lname and same(got[1], self.largs):
+                self.repaired += got[2]
+                return CALL_END
+            if ended:
+                return ""            # (cut off inside it: the parser closes what went out, as any call the output ended in)
+            # Not a call after all (text after the arguments, JSON that breaks off inside them): it cannot become
+            # the answer's text any more, so it ends as the parser ends a call that does not parse - what went out
+            # stands, marked incomplete (#613).  The <arg_key> left open is what makes it one that does not parse;
+            # the unread rest after it is for the server's log (parser.malformed)
+            rest = self.body[self.lstart if self.ls == "other" else self.lp:].replace("<", "\\u003c")
+            return ('"' + ARG_VAL_END if self.lstr else "") + ARG_KEY + rest + CALL_END
+        if got is None:
+            return self._close() + self.body       # (not a call the parser can read: its text, as the answer's)
+        name, args, repaired = got
+        self.repaired += repaired
         return (self._close() + CALL_START + name +
-                "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + val(v) + ARG_VAL_END for k, v in args.items()) + CALL_END)
+                "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + self._val(v) + ARG_VAL_END for k, v in args.items()) +
+                CALL_END)
+
+    # The body as it is written, for _live.  The opening that streams: the name and "args":{ - as the template
+    # writes them, or with the comma and the quotes before / around "args" left out (_loose's first shape, the
+    # model's own top pick on some prompts).  The other loose shapes read only whole.
+    _OPEN = re.compile(_HEAD.pattern + _ARGS_KEY.pattern + r"\{")
+    _OPEN_MAX = 512                  # (a body this long with no opening read: not one that streams)
+    _WS = " \t\n\r"
+    _STR = re.compile(r'"(?:[^"\\\x00-\x1f]|\\.)*"')                               # a key, whole
+    _STR_PART = re.compile(r'(?:[^"\\\x00-\x1f]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*')   # a string's content, so far
+    _ESC_PART = re.compile(r'\\(?:u[0-9a-fA-F]{0,3})?')                            # an escape still being written
+
+    def _live(self) -> str:
+        """What the body's new text adds to the call in the parser's form, while the call is written (`live`): the
+        opening <tool_call>NAME as soon as the name and the arguments' opening are read - the parser's tool_start -
+        then each argument: a string value piece by piece as the model writes it (JSON string content already; `<`
+        as \\u003c, see _val), any other value whole once it is complete.  Only text that is valid JSON so far goes
+        out, and an escape only when it is whole, so what went out can be closed at any point; at the first character
+        that is not, nothing more does (ls "broken") and the call's end decides (_call)."""
+        if self.ls in ("held", "tail", "broken"):
+            return ""
+        out, body, n = [], self.body, len(self.body)
+        if self.ls == "head":
+            m = self._OPEN.match(body)
+            try:
+                name = (json.loads('"' + m.group(1) + '"') or self.name.strip()) if m else ""
+            except ValueError:
+                name = ""
+            if not name or name != name.strip() or "<" in name or "\n" in name:   # (not a name the parser reads as it is)
+                if m or n > self._OPEN_MAX:
+                    self.ls = "held"
+                return ""
+            self.lname, self.lp, self.ls = name, m.end(), "key0"
+            out.append(self._close() + CALL_START + name + "\n")   # (the line's end: the name is whole)
+        while self.ls not in ("tail", "broken"):
+            if self.ls == "str":
+                end = self._STR_PART.match(body, self.lp).end()
+                out.append(body[self.lp:end].replace("<", "\\u003c"))
+                self.lp = end
+                if end >= n or self._ESC_PART.fullmatch(body, end):
+                    break                                  # (more to come; an escape waits until it is whole)
+                if body[end] != '"':
+                    self.ls = "broken"                     # (a control character, an escape JSON has not)
+                    break
+                self.largs[self.lkey] = json.loads(body[self.lstart:end + 1])
+                out.append('"' + ARG_VAL_END)
+                self.lp, self.ls, self.lstr = end + 1, "next", False
+                continue
+            if self.ls == "other":
+                # a value that is no string - a number, a literal, an object, an array: found by its brackets and
+                # quotes, read by json.loads, and sent whole (the parser streams only string values)
+                end = -1
+                while self.lp < n and end < 0:
+                    c = body[self.lp]
+                    if self.lquote:
+                        self.lquote, self.lesc = self.lesc or c != '"', not self.lesc and c == "\\"
+                    elif c == '"':
+                        self.lquote = True
+                    elif c in "{[":
+                        self.ldepth += 1
+                    elif c in "}]" and self.ldepth <= 1:
+                        end = self.lp + self.ldepth         # (its own closing bracket; the arguments' is not its)
+                    elif c in "}]":
+                        self.ldepth -= 1
+                    elif self.ldepth == 0 and (c == "," or c in self._WS):
+                        end = self.lp
+                    self.lp += end < 0
+                if end < 0:
+                    break
+                try:
+                    v = json.loads(body[self.lstart:end])
+                except ValueError:
+                    self.lp, self.ls = self.lstart, "broken"
+                    break
+                self.largs[self.lkey] = v
+                out.append(ARG_KEY + self.lkey + ARG_KEY_END + ARG_VAL + self._val(v) + ARG_VAL_END)
+                self.lp, self.ls = end, "next"
+                continue
+            while self.lp < n and body[self.lp] in self._WS:
+                self.lp += 1
+            if self.lp >= n:
+                break
+            c = body[self.lp]
+            if self.ls in ("key0", "key") and c == '"':
+                m = self._STR.match(body, self.lp)
+                if not m:
+                    break                                  # (the key is not whole yet)
+                try:
+                    self.lkey = json.loads(m.group(0))
+                except ValueError:
+                    self.ls = "broken"
+                    break
+                self.lp, self.ls = m.end(), "colon"
+            elif self.ls == "colon" and c == ":":
+                self.lp, self.ls = self.lp + 1, "value"
+            elif self.ls == "value" and c == '"':
+                out.append(ARG_KEY + self.lkey + ARG_KEY_END + ARG_VAL + '"')
+                self.lstart, self.lp, self.ls, self.lstr = self.lp, self.lp + 1, "str", True
+            elif self.ls == "value":
+                self.lstart, self.ldepth, self.lquote, self.lesc, self.ls = self.lp, 0, False, False, "other"
+            elif self.ls == "next" and c == ",":
+                self.lp, self.ls = self.lp + 1, "key"
+            elif self.ls in ("key0", "next") and c == "}":
+                self.lp, self.ls = self.lp + 1, "tail"     # (the arguments are whole: _call reads what follows)
+            else:
+                self.ls = "broken"
+        return "".join(out)
 
 
 class OutputParser:
@@ -1514,7 +1670,7 @@ class OutputParser:
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else \
-            InklingRewriter(thinking) if inkling else None   # (Inkling 2: its typed segments, InklingRewriter)
+            InklingRewriter(thinking, live=stream_tools) if inkling else None   # (Inkling 2: its typed segments)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False

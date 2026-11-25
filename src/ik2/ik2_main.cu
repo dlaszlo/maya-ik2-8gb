@@ -8311,10 +8311,12 @@ int main(int argc, char** argv) {
         }
     }
     if (lo) std::fclose(lo);
-    if (!force.empty())
+    const auto print_forced = [&] {
         std::printf("forced: %d tokens fed, the model's pick agreed with the next one %d times (%.2f%%)\n",
                     (int) std::min<size_t>(force.size(), out.size()), agree,
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
+    };
+    if (!force.empty() && !drafter) print_forced();
 
     if (suffix_stats.forwards)
         std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
@@ -8357,7 +8359,8 @@ int main(int argc, char** argv) {
         // draft 7 after the anchor, verify the 8 in one call, keep the agreeing prefix and the target's next token
         float *raw = dalloc<float>(c.C), *anchor_h = dalloc<float>(c.C);
         auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
-        int anchor = first_best, P = (int) prompt.size();
+        int anchor = force.empty() ? first_best : force[0], P = (int) prompt.size();
+        if (!force.empty()) agree += first_best == force[0];
         out.push_back(anchor);
         // IK2_DRAFT_WIDTH: the tokens a step verifies, the anchor and width - 1 drafts (2 .. 8)
         const int width = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, ik2::draft::kBlock)
@@ -8449,6 +8452,13 @@ int main(int argc, char** argv) {
             } else {
                 for (int j = 0; j < B; ++j) g[j] = ag[j];
             }
+            // (IK2_FORCE: the forced tokens stand for the target's picks - two drafters then see the same text, and
+            //  their acceptance compares them directly)
+            int gm[ik2::draft::kBlock];   // (the target's own picks: counted where its inputs were the forced text)
+            for (int j = 0; j < B; ++j) {
+                gm[j] = g[j];
+                if (out.size() + j < force.size()) g[j] = force[out.size() + j];
+            }
             if (margin_check) {   // the target's top-2 margin at each verified position (near ties flip)
                 for (int j = 0; j < B; ++j) {
                     const float* r = logits.data() + (size_t) j * c.n_vocab;
@@ -8478,6 +8488,8 @@ int main(int argc, char** argv) {
             }
             int n = 0;
             while (n < B - 1 && dr[n] == g[n]) ++n;
+            for (int j = 0; j <= n; ++j)
+                if (out.size() + j < force.size()) agree += gm[j] == g[j];
             if (n + 1 < B) {
                 if (use_block && n_steps >= block_check) block_rollback(n + 1);
                 else rollback(M, n + 1);
@@ -8494,6 +8506,7 @@ int main(int argc, char** argv) {
             t_verify += now() - t1;
         }
         for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
+        if (!force.empty()) print_forced();
         if (draft_probs && dp_steps)
             std::printf("draft probabilities: %ld drafts, the target's mean probability of a draft %.3f; a step of %d "
                         "would give %.2f tokens with sampling at temperature 1 (greedy: %.2f)\n",

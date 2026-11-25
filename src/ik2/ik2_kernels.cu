@@ -5218,7 +5218,7 @@ template <int SPLIT>
 __global__ void __launch_bounds__(SPLIT * 32)
 experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g,
                           const int* __restrict__ row_g, size_t off_down, int C, int F, const uint16_t* __restrict__ h,
-                          float* y) {
+                          float* y, float out_scale = 1.0f) {
     __shared__ float4 part[SPLIT][32];
     const int grp = blockIdx.y, n = n_g[grp];
     if (n <= 0) return;
@@ -5259,6 +5259,7 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
         tot.x += z.x, tot.y += z.y, tot.z += z.z, tot.w += z.w;
     }
     // the lane's columns 2 t, 2 t + 1: members 2 t, 2 t + 1; rows r and r + 8
+    if (out_scale != 1.0f) tot.x *= out_scale, tot.y *= out_scale, tot.z *= out_scale, tot.w *= out_scale;
     if (2 * t < n) {
         const int slot = row_g[grp * kGroupMax + 2 * t];
         y[(size_t) slot * C + r] = tot.x, y[(size_t) slot * C + r + 8] = tot.z;
@@ -6180,6 +6181,123 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
     else if (N <= 2048) launch_mv_blocks<4, 1>(type, W, N, K, x, y, s, scale);
     else launch_mv_blocks<4, 2>(type, W, N, K, x, y, s, scale);
     check("mv_blocks");
+}
+
+// mv_blocks for up to NT tokens over an NVFP4 matrix: a warp a row (the rows strided over a grid that fills the
+// device once), the row's blocks read once for all the tokens, each token's sum in row_dot's order - every token's
+// y the one-token kernel's bit for bit.  nt <= NT tokens, x rows ldx apart, y rows ldy apart.
+template <int NT>
+__global__ void mv_nvfp4_multi_kernel(const uint8_t* __restrict__ W, int N, int K, size_t rb,
+                                      const float* __restrict__ x, int ldx, int nt, float* __restrict__ y, int ldy,
+                                      float scale) {
+    extern __shared__ float xs[];
+    const int xf = (int) ((xp_floats(K) + 3) & ~(size_t) 3);
+    for (int t = 0; t < nt; ++t) load_xs_f32(x + (size_t) t * ldx, K, xs + (size_t) t * xf);
+    __syncthreads();
+    const int lane = threadIdx.x & 31, nw = blockDim.x >> 5, nsub = K / 16;
+    for (int row = blockIdx.x * nw + (threadIdx.x >> 5); row < N; row += gridDim.x * nw) {
+        const uint8_t* w = W + (size_t) row * rb;
+        float acc[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+        for (int sb = lane; sb < nsub; sb += 32) {
+            const uint8_t* b = w + (size_t) (sb >> 2) * 36;
+            const int sub = sb & 3;
+            const float d = ue4m3((uint8_t) (__ldg((const uint32_t*) b) >> (8 * sub)));
+            const uint32_t q0 = __ldg((const uint32_t*) (b + 4 + sub * 8));
+            const uint32_t q1 = __ldg((const uint32_t*) (b + 8 + sub * 8));
+            const int xo = (sb >> 1) * 36 + (sb & 1) * 16;
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                if (t < nt) {
+                    const float* xt = xs + (size_t) t * xf + xo;
+                    const float4 x0 = *(const float4*) (xt + 0), x1 = *(const float4*) (xt + 4);
+                    const float4 x2 = *(const float4*) (xt + 8), x3 = *(const float4*) (xt + 12);
+                    acc[t] += d * nvfp4_sub_dot(q0, q1, x0, x1, x2, x3);
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t < nt) {
+                float a = acc[t];
+                for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+                if (lane == 0) y[(size_t) t * ldy + row] = a * scale;
+            }
+        }
+    }
+}
+
+template <int NT>
+static bool launch_mv_nvfp4_multi(const uint8_t* W, int N, int K, const float* x, int ldx, int nt, float* y, int ldy,
+                                  cudaStream_t s, float scale) {
+    constexpr int kWarps = 16;
+    static int n_sm = 0, smem_optin = 0, smem_set = 48 << 10;
+    if (!n_sm) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    }
+    const int smem = nt * (int) ((xp_floats(K) + 3) & ~(size_t) 3) * 4;
+    if (smem > smem_optin) return false;
+    if (smem > smem_set) {
+        cudaFuncSetAttribute(mv_nvfp4_multi_kernel<NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        check("mv_nvfp4_multi (shared memory)");
+        smem_set = smem;
+    }
+    int per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, mv_nvfp4_multi_kernel<NT>, kWarps * 32, smem);
+    const int grid = std::max(1, std::min(n_sm * std::max(1, per_sm), (N + kWarps - 1) / kWarps));
+    mv_nvfp4_multi_kernel<NT><<<grid, kWarps * 32, smem, s>>>(W, N, K, mv_row_bytes(kNVFP4, K), x, ldx, nt, y, ldy,
+                                                              scale);
+    check("mv_nvfp4_multi");
+    return true;
+}
+
+// T <= 8 tokens' FP16 rows (x16, K apart) over an NVFP4 matrix on the tensor cores - experts_block_down_kernel with
+// the matrix as one group's expert: y [t][N] (N apart), times scale.  N % 16 == 0, K % 64 == 0.
+bool mv_nvfp4_mma(const uint8_t* W, int N, int K, const uint16_t* x16, int T, float* y, float scale, cudaStream_t s) {
+    if (T < 1 || T > kGroupMax || N % 16 || K % 64) return false;
+    static int* tab = nullptr;                    // n: 1 .. 8, then row: 0 .. 7
+    static const uint8_t** blob = nullptr;
+    static const uint8_t* blob_w = nullptr;
+    if (!tab) {
+        int h[2 * kGroupMax];
+        for (int i = 0; i < kGroupMax; ++i) h[i] = i + 1, h[kGroupMax + i] = i;
+        cudaMalloc(&tab, sizeof h);
+        cudaMemcpy(tab, h, sizeof h, cudaMemcpyHostToDevice);
+        cudaMalloc(&blob, sizeof(void*));
+        check("mv_nvfp4_mma (tables)");
+    }
+    if (blob_w != W) {
+        cudaStreamSynchronize(s);
+        cudaMemcpy(blob, &W, sizeof(void*), cudaMemcpyHostToDevice);
+        blob_w = W;
+    }
+    experts_block_down_kernel<4><<<dim3((unsigned) (N / 16), 1u), 128, 0, s>>>(blob, tab + (T - 1), tab + kGroupMax, 0,
+                                                                              N, K, x16, y, scale);
+    check("mv_nvfp4_mma");
+    return true;
+}
+
+void mv_blocks_multi(int type, const uint8_t* W, int N, int K, const float* x, int ldx, int T, float* y, int ldy,
+                     cudaStream_t s, float scale) {
+    static const int nt_max = getenv("IK2_MV_NT") ? std::clamp(std::atoi(getenv("IK2_MV_NT")), 1, 8) : 8;
+    for (int t0 = 0; t0 < T;) {
+        const int nt = std::min(nt_max, T - t0);
+        const float* xt = x + (size_t) t0 * ldx;
+        float* yt = y + (size_t) t0 * ldy;
+        bool done = false;
+        if (type == kNVFP4 && N > 0 && K <= 8192 && K % 64 == 0 && nt > 1) {
+            if (nt <= 2) done = launch_mv_nvfp4_multi<2>(W, N, K, xt, ldx, nt, yt, ldy, s, scale);
+            else if (nt <= 4) done = launch_mv_nvfp4_multi<4>(W, N, K, xt, ldx, nt, yt, ldy, s, scale);
+            else done = launch_mv_nvfp4_multi<8>(W, N, K, xt, ldx, nt, yt, ldy, s, scale);
+        }
+        if (!done)
+            for (int t = 0; t < nt; ++t) mv_blocks(type, W, N, K, xt + (size_t) t * ldx, yt + (size_t) t * ldy, s, scale);
+        t0 += nt;
+    }
 }
 
 template <class KV>

@@ -45,6 +45,8 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 /// The base logits through the target's head kept as planar Q8_0 (int8 [n_rows][C], FP16 scales [n_rows][C / 32]):
 /// propose's lm_f16 is not read then (the FP16 copy is fold()'s only).
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
+/// ... through the head kept as NVFP4 blocks (IK2_DENSE4=head: [n_rows][C] of head / scale), on the tensor cores.
+void set_head_nvfp4(Drafter* d, const uint8_t* blocks, float scale);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
 /// A conversation of P positions kept in host RAM and brought back (the serve loop's IK2_SLOT_KEEP): the bytes of its

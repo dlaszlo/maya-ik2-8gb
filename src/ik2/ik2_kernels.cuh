@@ -204,6 +204,13 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
 /// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
 /// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
 void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s, float scale = 1.0f);
+/// The same for T tokens (x rows ldx apart, y rows ldy apart): an NVFP4 matrix's rows read once for up to 8 tokens
+/// (IK2_MV_NT=n: n), each token's y mv_blocks' bit for bit; any other type a token at a time.
+void mv_blocks_multi(int type, const uint8_t* W, int N, int K, const float* x, int ldx, int T, float* y, int ldy,
+                     cudaStream_t s, float scale = 1.0f);
+/// The same on the tensor cores for T <= 8 tokens' FP16 rows x16 [T][K] over an NVFP4 matrix: y [T][N] (rows N
+/// apart), times scale; FP16 inputs, so not mv_blocks' bit for bit.  false: not this shape (N % 16, K % 64, T).
+bool mv_nvfp4_mma(const uint8_t* W, int N, int K, const uint16_t* x16, int T, float* y, float scale, cudaStream_t s);
 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.

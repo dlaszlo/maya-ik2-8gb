@@ -28,6 +28,8 @@
 #include "ik2_kernels.cuh"
 #include "strata/artifact/gguf_reader.hpp"
 
+#include <array>
+
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -406,6 +408,15 @@ double g_lazy_fit = 0;
 // (9 KB).  A host-to-device copy of 28 KB and more - three experts' rows - is the copy engine's, where it queues
 // behind a lazy copy in flight (4.5 MB: 375 us); up to 24 KB a copy travels with the commands and does not wait.
 bool g_cpu_sum = true;
+constexpr int kTokSlots = 128;      // the token path's picks a call at most (a verify window: 16 tokens of 8 picks)
+bool g_cpu_group = true;            // IK2_CPU_GROUP=0: every (token, expert) pick of the CPU lane a job of its own
+bool g_win_observe = true;          // IK2_WIN_OBSERVE=0: the cache policy does not see a verify window's picks
+unsigned long long g_n_cpu_grouped = 0;   // picks that shared another pick's job
+// a verify window's forward calls on the cache path (g_rec, T > 1): where their time goes and what their picks were
+struct WinTl {
+    unsigned long long calls = 0, tokens = 0, hit = 0, waited = 0, cpu = 0, cpu_jobs = 0, lazy = 0;
+    double total = 0, sync = 0, pool = 0;
+} g_wtl;
 // Experiments that change the model's arithmetic (measured against the unchanged model with IK2_FORCE and
 // IK2_LOGITS_OUT; off unless set):
 //   IK2_X_K=N           N experts a token instead of the file's expert_used_count
@@ -437,16 +448,19 @@ void lazy_poll() {
 struct Timeline {
     bool on = false;
     int level = 0;
-    double gpu_hits = 0;
+    double gpu_hits = 0, gpu_prev = 0;   // (IK2_TL=2: the GPU's own experts; the previous visit's GPU work left)
+    double head_wait = 0, head_mm = 0, head_copy = 0;   // (IK2_TL=2: the head's: the last visit's GPU work, the
+                                                        //  product (and softcap / argmax), the copy to the host)
     double t = 0, launch_attn = 0, sync_wait = 0, decide = 0, launch_hits = 0, pool_wait = 0, tail = 0, head = 0, other = 0;
-    long tokens = 0;
+    long tokens = 0, inputs = 0;
     void lap(double& acc) {
         if (!on) return;
         const double n = now();
         if (t > 0) acc += n - t;
         t = n;
     }
-} g_tl;
+} g_tl, g_tlw;   // (g_tlw: the same for a verify window - g_rec, T > 1)
+Timeline* g_tl_cur = nullptr;   // (the one this forward call laps: run_head's IK2_TL=2 laps)
 // IK2_PROF=1: the stream waited for at each phase's end, its time added to the phase (slower, but where it goes)
 bool g_prof = false;
 bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs too
@@ -492,6 +506,8 @@ bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
+int g_attn_multi_max = 1;   // IK2_ATTN_MULTI=N (1 .. 16): a verify window of up to N tokens on attn_multi, a longer one on the
+                            // flash path (measured, rec4: the flash path is ahead from 3 tokens on - 8: 9 ms a window - and even at 2)
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
 struct Prof {
     double attn = 0, route = 0, upload = 0, experts = 0, rest = 0;
@@ -612,7 +628,8 @@ void add_f16_shadow(Mat& m) {
     else k::decode_f16(m.type, m.raw, (size_t) m.N * m.K, m.f16, g_s);
 }
 
-bool upload_nvfp4(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values);
+bool upload_nvfp4(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values,
+                  const std::vector<std::string>& names);
 Mat load_mat(const Shards& S, const std::string& n, int N, int Kd, bool q4 = false) {
     const auto* t = S.info(n);
     if (!t) die("no tensor " + n);
@@ -623,7 +640,7 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd, bool q4 = fal
     m.type = (int) t->type, m.N = N, m.K = Kd;
     const size_t nb = tensor_bytes(*t);
     if (g_dense_q8) {
-        if (q4 && upload_nvfp4(m, {S.data(n)}, {(size_t) N * Kd})) return m;
+        if (q4 && upload_nvfp4(m, {S.data(n)}, {(size_t) N * Kd}, {n})) return m;
         if (upload_planar(m, {S.data(n)}, {(size_t) N * Kd})) return m;
         m.raw = dalloc<uint8_t>(nb);
         CU(cudaMemcpy(m.raw, S.data(n), nb, cudaMemcpyHostToDevice));
@@ -651,8 +668,98 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd, bool q4 = fal
 // matrix divided by m.scale, which the products multiply back (mv_blocks' scale, the GEMM's alpha).
 int g_dense4 = 0;   // bit 0: the head, bit 1: the attention
 std::string g_dense4_note;
-bool upload_nvfp4(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
+// IK2_DENSE4_FILE=path: the NVFP4 blocks and scales of the matrices IK2_DENSE4 converts, from an offline encoder
+// (bench-2026-11-25/gptq/gptq_nvfp4.py: GPTQ against calibration inputs) instead of the rule below.  A record an
+// engine matrix: "IK2D4\0\0\0", uint32 version 1, uint32 records; each: uint32 parts, per part uint32 name length,
+// the GGUF tensor's name, uint32 rows; uint32 K; float32 scale; uint64 bytes; the blocks as `out` below holds them.
+// Looked up by the parts' names in order; a matrix the file lacks, or whose rows / K / bytes differ, stops the load.
+struct D4Rec {
+    std::vector<uint32_t> rows;
+    uint32_t K = 0;
+    float scale = 0;
+    std::vector<uint8_t> blocks;
+};
+std::map<std::string, D4Rec> g_d4_file;
+// IK2_DENSE4_LAYERS=a-b,c,...: the layers whose attention IK2_DENSE4 converts (default: every layer)
+bool d4_layer(int l) {
+    static std::vector<char> on;
+    static bool all = true, parsed = false;
+    if (!parsed) {
+        parsed = true;
+        if (const char* v = getenv("IK2_DENSE4_LAYERS")) {
+            all = false;
+            on.assign(1024, 0);
+            std::string s = v;
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t j = s.find(',', i);
+                if (j == std::string::npos) j = s.size();
+                const std::string t = s.substr(i, j - i);
+                int a = -1, b = -1;
+                if (std::sscanf(t.c_str(), "%d-%d", &a, &b) == 2) {
+                } else if (std::sscanf(t.c_str(), "%d", &a) == 1) b = a;
+                for (int k = std::max(0, a); k <= b && k < 1024; ++k) on[k] = 1;
+                i = j + 1;
+            }
+        }
+    }
+    return all || (l >= 0 && l < (int) on.size() && on[l]);
+}
+std::string g_d4_path;
+int g_d4_used = 0;
+void d4_file_read(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) die("IK2_DENSE4_FILE: cannot open " + path);
+    auto rd = [&](void* p, size_t n) {
+        if (std::fread(p, 1, n, f) != n) die("IK2_DENSE4_FILE: " + path + " ends early");
+    };
+    char magic[8];
+    uint32_t ver = 0, n = 0;
+    rd(magic, 8), rd(&ver, 4), rd(&n, 4);
+    if (std::memcmp(magic, "IK2D4\0\0\0", 8) || ver != 1) die("IK2_DENSE4_FILE: " + path + " is not version 1");
+    for (uint32_t i = 0; i < n; ++i) {
+        D4Rec r;
+        uint32_t np = 0;
+        rd(&np, 4);
+        std::string key;
+        for (uint32_t j = 0; j < np; ++j) {
+            uint32_t len = 0, rows = 0;
+            rd(&len, 4);
+            std::string nm(len, '\0');
+            rd(nm.data(), len), rd(&rows, 4);
+            key += (j ? "|" : "") + nm;
+            r.rows.push_back(rows);
+        }
+        uint64_t nb = 0;
+        rd(&r.K, 4), rd(&r.scale, 4), rd(&nb, 8);
+        r.blocks.resize(nb);
+        rd(r.blocks.data(), nb);
+        g_d4_file[key] = std::move(r);
+    }
+    std::fclose(f);
+}
+bool upload_nvfp4(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values,
+                  const std::vector<std::string>& names) {
     if (m.type != k::kQ8_0 || m.K % 64) return false;
+    if (!g_d4_path.empty() && names[0].find(".attn_") != std::string::npos) {   // (the attention's: the head keeps the rule)
+        std::string key;
+        for (size_t j = 0; j < names.size(); ++j) key += (j ? "|" : "") + names[j];
+        const auto it = g_d4_file.find(key);
+        if (it == g_d4_file.end()) die("IK2_DENSE4_FILE: no record for " + key);
+        const D4Rec& r = it->second;
+        bool ok = r.K == (uint32_t) m.K && r.rows.size() == part_values.size();
+        size_t values = 0;
+        for (size_t j = 0; ok && j < part_values.size(); ++j)
+            ok = (size_t) r.rows[j] * m.K == part_values[j], values += part_values[j];
+        if (!ok || r.blocks.size() != values / 64 * 36) die("IK2_DENSE4_FILE: the record for " + key + " does not fit");
+        m.type = k::kNVFP4;
+        m.scale = r.scale;
+        m.raw = dalloc<uint8_t>(r.blocks.size());
+        CU(cudaMemcpy(m.raw, r.blocks.data(), r.blocks.size(), cudaMemcpyHostToDevice));
+        ++g_d4_used;
+        g_dense4_note = "IK2_DENSE4: " + std::to_string(g_d4_used) + " matrices from " + g_d4_path;
+        return true;
+    }
     std::vector<size_t> sub0{0};   // the first sub-block of each part
     for (size_t v : part_values) sub0.push_back(sub0.back() + v / 16);
     const size_t n_sub = sub0.back();
@@ -862,8 +969,9 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
     {
         std::vector<const uint8_t*> ps;
         std::vector<size_t> vs;
-        for (const auto& pt : parts) ps.push_back(S.data(pt.name)), vs.push_back((size_t) pt.N * Kd);
-        if (q4 && upload_nvfp4(out, ps, vs)) return true;
+        std::vector<std::string> names;
+        for (const auto& pt : parts) ps.push_back(S.data(pt.name)), vs.push_back((size_t) pt.N * Kd), names.push_back(pt.name);
+        if (q4 && upload_nvfp4(out, ps, vs, names)) return true;
         if (upload_planar(out, ps, vs)) return true;
     }
     out.raw = dalloc<uint8_t>(nb_tot);
@@ -922,6 +1030,44 @@ void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y
         return;
     }
     if (m.K <= 8192 && (T == 1 || (size_t) m.N * m.K > g_w16_n)) {
+        // (more tokens over a matrix of NVFP4 blocks - the head: its rows read once for up to 8 of them; IK2_MV_MULTI=0:
+        //  a token at a time; IK2_MV_CHECK=1: both, compared bit for bit - a measurement switch;
+        //  IK2_MV_MULTI=2, the default: an NVFP4 matrix's tokens on the tensor cores, their FP16 rows - not bit for bit,
+        //  the same KL on rec4 and 4.1x faster for 8 tokens; 1: the bit-exact kernel)
+        static const int multi = getenv("IK2_MV_MULTI") ? atoi(getenv("IK2_MV_MULTI")) : 2;
+        static const bool check = getenv("IK2_MV_CHECK") && atoi(getenv("IK2_MV_CHECK"));
+        if (T > 1 && !m.q8 && multi) {
+            bool mma = multi == 2 && x16 && m.type == k::kNVFP4 && ldy == m.N && m.N % 16 == 0 && m.K % 64 == 0;
+            for (int t0 = 0; mma && t0 < T; t0 += k::kGroupMax)
+                mma = k::mv_nvfp4_mma(m.raw, m.N, m.K, x16 + (size_t) t0 * m.K, std::min(k::kGroupMax, T - t0),
+                                      Y + (size_t) t0 * ldy, m.scale, g_s);
+            if (!mma) k::mv_blocks_multi(m.type, m.raw, m.N, m.K, x32, m.K, T, Y, ldy, g_s, m.scale);
+            if (check) {
+                static float* ref = nullptr;
+                static size_t ref_n = 0;
+                const size_t n = (size_t) T * m.N;
+                if (n > ref_n) {
+                    if (ref) CU(cudaFree(ref));
+                    CU(cudaMalloc(&ref, n * 4));
+                    ref_n = n;
+                }
+                for (int t = 0; t < T; ++t) mv1(m, x32 + (size_t) t * m.K, ref + (size_t) t * m.N);
+                std::vector<float> a((size_t) m.N), b((size_t) m.N);
+                size_t bad = 0;
+                for (int t = 0; t < T; ++t) {
+                    CU(cudaMemcpyAsync(a.data(), Y + (size_t) t * ldy, (size_t) m.N * 4, cudaMemcpyDeviceToHost, g_s));
+                    CU(cudaMemcpyAsync(b.data(), ref + (size_t) t * m.N, (size_t) m.N * 4, cudaMemcpyDeviceToHost, g_s));
+                    CU(cudaStreamSynchronize(g_s));
+                    for (int r = 0; r < m.N; ++r) bad += std::memcmp(&a[r], &b[r], 4) != 0;
+                }
+                static size_t n_cmp = 0, n_bad = 0;
+                n_cmp += n, n_bad += bad;
+                if (bad || (n_cmp / n) % 200 == 1)
+                    std::fprintf(stderr, "IK2_MV_CHECK: %d tokens x %d rows, %zu differ; so far %zu of %zu\n", T, m.N,
+                                 bad, n_bad, n_cmp);
+            }
+            return;
+        }
         for (int t = 0; t < T; ++t) mv1(m, x32 + (size_t) t * m.K, Y + (size_t) t * ldy);
         return;
     }
@@ -1769,6 +1915,28 @@ struct Cand {
     const int* idx = nullptr;      // [n] token ids, in no order
     const float* val = nullptr;    // [n] their logits
 } g_cand;
+// (the cache path's kCand for a window: each row's k::cand_topk out, [16][2 + 2 kCandCap], pinned; rows whose
+//  candidates overflowed read their logits from the device - W.logits, valid until the next forward)
+int* g_rcand_d = nullptr;
+int* g_rcand_h = nullptr;
+int g_rcand_rows = 0;
+const float* g_rcand_logits = nullptr;   // (the device rows, n_rows apart)
+int g_rcand_ld = 0;
+// row t's candidates (logit, token) of the last cache-path kCand forward
+void rcand(int t, int n_vocab, std::vector<std::pair<float, int>>& cd) {
+    const int* r = g_rcand_h + (size_t) t * (2 + 2 * kCandCap);
+    if (r[0] <= kCandCap) {
+        const int* idx = r + 2;
+        const float* val = (const float*) (r + 2 + kCandCap);
+        cd.resize(r[0]);
+        for (int i = 0; i < r[0]; ++i) cd[i] = {val[i], idx[i]};
+        return;
+    }
+    std::vector<float> row((size_t) n_vocab);
+    CU(cudaMemcpy(row.data(), g_rcand_logits + (size_t) t * g_rcand_ld, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost));
+    cd.resize(n_vocab);
+    for (int v = 0; v < n_vocab; ++v) cd[v] = {row[v], v};
+}
 
 __global__ void gather_f16_16_kernel(const uint16_t* __restrict__ x16, const int* __restrict__ idx, int n, int C,
                                      uint16_t* __restrict__ y16) {
@@ -1830,6 +1998,56 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
         CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].G, C, g, R, &zero, gn, C));
         k::loop_gate_blend(gt[j].x, gt[j].m, f, gn, (size_t) T * C, gt[j].y, g_s);
     }
+}
+
+// IK2_COV_OUT=dir (a calibration switch, with IK2_COV_LAYERS=a-b, default all): each layer's attention inputs'
+// second moments for the GPTQ encoder (tools: bench-2026-11-25/gptq) - H = sum x x^T over the prompt's tokens
+// (calls of more than one token; the three passes of a looped layer summed), from the FP16 rows the products take:
+// role 0 the q input (q, r, gate rows), 1 k's, 2 v's (a sliding layer outside a looped pass: the same rows as q's),
+// 3 attn_output's (HD).  On the GPU, FP32 (cublasGemmEx); written at the end as dir/L<l>.<q|k|v|o>.cov:
+// int32 K, int64 rows, then K x K float32.
+struct CovAcc {
+    std::string dir;
+    int l0 = 0, l1 = -1;
+    std::vector<std::array<float*, 4>> h;
+    std::vector<std::array<long long, 4>> n;
+    std::vector<std::array<int, 4>> k;
+} g_cov;
+void cov_add(int l, int role, const uint16_t* x16, int T, int K) {
+    if (g_cov.dir.empty() || T < 2 || l < g_cov.l0 || l > g_cov.l1) return;
+    float*& H = g_cov.h[l][role];
+    if (!H) {
+        CU(cudaMalloc(&H, (size_t) K * K * 4));
+        CU(cudaMemsetAsync(H, 0, (size_t) K * K * 4, g_s));
+        g_cov.k[l][role] = K;
+    }
+    if (g_cov.k[l][role] != K) die("IK2_COV_OUT: an input's width changed");
+    const float one = 1.0f;
+    // (x16 row-major [T][K] is column-major [K][T]: H [K][K] += X X^T)
+    CB(cublasGemmEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_T, K, K, T, &one, x16, CUDA_R_16F, K, x16, CUDA_R_16F, K, &one, H,
+                    CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    g_cov.n[l][role] += T;
+}
+void cov_write() {
+    if (g_cov.dir.empty()) return;
+    CU(cudaStreamSynchronize(g_s));
+    const char* nm[4] = {"q", "k", "v", "o"};
+    for (size_t l = 0; l < g_cov.h.size(); ++l)
+        for (int r = 0; r < 4; ++r) {
+            if (!g_cov.h[l][r]) continue;
+            const int K = g_cov.k[l][r];
+            std::vector<float> v((size_t) K * K);
+            CU(cudaMemcpy(v.data(), g_cov.h[l][r], v.size() * 4, cudaMemcpyDeviceToHost));
+            const std::string path = g_cov.dir + "/L" + std::to_string(l) + "." + nm[r] + ".cov";
+            FILE* f = std::fopen(path.c_str(), "wb");
+            if (!f) die("IK2_COV_OUT: cannot write " + path);
+            const int32_t k32 = K;
+            const int64_t rows = g_cov.n[l][r];
+            std::fwrite(&k32, 4, 1, f), std::fwrite(&rows, 8, 1, f), std::fwrite(v.data(), 4, v.size(), f);
+            std::fclose(f);
+            std::printf("IK2_COV_OUT: layer %zu %s: K %d, %lld rows (%.1f a column)\n", l, nm[r], K, (long long) rows,
+                        (double) rows / K);
+        }
 }
 
 // One layer's attention + post-attention conv + residual into r_out ([T][C]).
@@ -1895,6 +2113,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         xk16 = W.xk16, xv16 = W.xv16;
     }
     const int HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
+    if (!g_cov.dir.empty())   // (IK2_COV_OUT: the rows the products below take)
+        cov_add(l, 0, W.x16, T, C), cov_add(l, 1, xk16, T, C), cov_add(l, 2, xv16, T, C);
     float *q_p = W.q, *k_p = W.kk, *v_p = W.vv, *r_p = W.rr, *gate_p = W.gate, *sink_p = W.sink;
     float *kd_p = W.dyn, *vd_p = W.dyn;
     if (Ly.sliding) {
@@ -2028,7 +2248,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
-    } else if (T <= 8 && g_group && g_group_attn) {
+    } else if (T <= (g_rec ? g_attn_multi_max : 8) && g_group && g_group_attn) {
         if (g_kv_fp8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
@@ -2156,6 +2376,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         }
     }
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
+    if (!g_cov.dir.empty()) cov_add(l, 3, W.x16, T, HD);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
@@ -2523,6 +2744,11 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
         }
         if (out_mode != OutMode::kNone) {
             const int t0 = all_logits ? 0 : T - 1, nt = T - t0;
+            Timeline* tl = g_tl_cur && g_tl_cur->on && g_tl_cur->level >= 2 ? g_tl_cur : nullptr;
+            if (tl) {
+                CU(cudaStreamSynchronize(g_s));
+                tl->lap(tl->head_wait);
+            }
             if (out_mode == OutMode::kArgmax) {
                 argmax_out->resize(nt);
                 for (int i = 0; i < nt; i += 16) {
@@ -2531,14 +2757,52 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
                     if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
                     else k::argmax_rows(W.logits, c.n_rows, n, c.n_vocab, W.argmax_d + i, g_s);
                 }
+                if (tl) {
+                    CU(cudaStreamSynchronize(g_s));
+                    tl->lap(tl->head_mm);
+                }
                 CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
                 CU(cudaStreamSynchronize(g_s));
                 for (int i = 0; i < nt; ++i) (*argmax_out)[i] = W.argmax_h[i];
+            } else if (out_mode == OutMode::kCand && nt <= 16) {   // (each row's candidates: k::cand_topk)
+                const size_t cs = 2 + 2 * (size_t) kCandCap;
+                if (!g_rcand_d) {
+                    CU(cudaMalloc(&g_rcand_d, 16 * cs * 4));
+                    CU(cudaHostAlloc(&g_rcand_h, 16 * cs * 4, cudaHostAllocPortable));
+                }
+                matmul(M.out_w, W.xq + (size_t) t0 * C, W.x16, nt, W.logits, c.n_rows);
+                k::softcap(W.logits, (size_t) nt * c.n_rows, c.logit_cap, g_s);
+                if (tl) {
+                    CU(cudaStreamSynchronize(g_s));
+                    tl->lap(tl->head_mm);
+                }
+                for (int t = 0; t < nt; ++t)
+                    k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap,
+                                 W.cand_part, g_rcand_d + t * cs, g_s);
+                CU(cudaMemcpyAsync(g_rcand_h, g_rcand_d, (size_t) nt * cs * 4, cudaMemcpyDeviceToHost, g_s));
+                CU(cudaStreamSynchronize(g_s));
+                if (tl) tl->lap(tl->head_copy);
+                g_rcand_rows = nt, g_rcand_logits = W.logits, g_rcand_ld = c.n_rows;
+                g_cand.n = -1;
+                if (nt == 1) {   // (one token: as the resident path's g_cand; overflowed - its logits, this once)
+                    if (g_rcand_h[0] <= kCandCap) {
+                        g_cand.n = g_rcand_h[0], g_cand.idx = g_rcand_h + 2;
+                        g_cand.val = (const float*) (g_rcand_h + 2 + kCandCap);
+                    } else {
+                        const size_t at = logits_out.size();
+                        logits_out.resize(at + (size_t) c.n_vocab);
+                        CU(cudaMemcpy(logits_out.data() + at, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost));
+                    }
+                }
             } else {
                 for (int i = 0; i < nt; i += 16) {   // (W.logits holds 16 rows)
                     const int n = std::min(16, nt - i);
                     matmul(M.out_w, W.xq + (size_t) (t0 + i) * C, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
                     k::softcap(W.logits, (size_t) n * c.n_rows, c.logit_cap, g_s);
+                    if (tl) {
+                        CU(cudaStreamSynchronize(g_s));
+                        tl->lap(tl->head_mm);
+                    }
                     const size_t at = logits_out.size();
                     logits_out.resize(at + (size_t) n * c.n_vocab);
                     CU(cudaMemcpy2DAsync(logits_out.data() + at, (size_t) c.n_vocab * 4, W.logits,
@@ -2546,6 +2810,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
                                          g_s));
                 }
                 CU(cudaStreamSynchronize(g_s));
+                if (tl) tl->lap(tl->head_copy);
             }
         }
     }
@@ -3562,6 +3827,10 @@ struct SampleCfg {   // temp <= 0: greedy
     double temp = 0, top_p = 1;
     int top_k = 0;
     std::mt19937_64* rng = nullptr;
+    // (a forced request - IK2_FORCE_Q, a measurement: row j "picks" (*forced)[forced_at + j], the cache path's
+    //  spec_step only)
+    const std::vector<int>* forced = nullptr;
+    int forced_at = 0;
 };
 // the serve loop's sampling distribution over candidates cd (logit, token): softmax(logit / temp) over the top_p
 // mass of the min(top_k, kCandK) largest (ties: the lower token first) - pick_top's - as (token, probability)
@@ -3653,6 +3922,11 @@ struct SpecCtl {
 // verified as one window.  next: the tokens chosen after the anchor - the accepted drafts and the target's own next
 // token (the last: not run yet, the next step's anchor), cut after a stop token.  The anchor and next but its last
 // are then in the cache, the convs' histories taken back to them and the drafter's context written for them.
+void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
+             std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0);
+void rollback(Model& M, int n, int slot = 0);
+// (the cache path - not every expert resident: the window through forward() as a verify window (g_rec), the
+//  rejected positions taken back by rollback(), each row's logits from the host copy)
 void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B, const SampleCfg& sc,
                const std::vector<int>& stops, std::vector<int>& next, int slot = 0) {
     const Config& c = M.c;
@@ -3666,7 +3940,44 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
     next.clear();
     std::vector<float> lo;
-    if (sc.temp <= 0) {
+    if (!g_fast) {
+        static double t_exp = 0;
+        std::vector<int> g;
+        g_rec = true;
+        const bool greedy = sc.temp <= 0 || sc.forced;
+        forward(M, tk, B, P, true, greedy ? OutMode::kArgmax : OutMode::kCand, std::string(), lo, &g, t_exp, slot);
+        g_rec = false;
+        for (int j = 0; j < B; ++j) {
+            int pick;
+            if (greedy) {
+                const int at = sc.forced_at + j;
+                pick = sc.forced && at < (int) sc.forced->size() ? (*sc.forced)[at] : g[j];
+            } else {
+                std::vector<std::pair<float, int>> cd;
+                rcand(j, c.n_vocab, cd);
+                const auto dist = sample_dist(cd, sc);
+                if (j == B - 1) {
+                    next.push_back(sample_from(dist, *sc.rng));
+                    break;
+                }
+                double pd = 0;
+                for (const auto& e : dist)
+                    if (e.first == dr[j]) pd = e.second;
+                if (std::uniform_real_distribution<double>(0, 1)(*sc.rng) < pd) {
+                    next.push_back(dr[j]);
+                    continue;
+                }
+                next.push_back(sample_from(dist, *sc.rng, dr[j]));
+                break;
+            }
+            if (j < B - 1 && pick == dr[j]) {
+                next.push_back(dr[j]);
+                continue;
+            }
+            next.push_back(pick);
+            break;
+        }
+    } else if (sc.temp <= 0) {
         std::vector<int> g;
         fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g, slot);
         int n = 0;
@@ -3708,13 +4019,16 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
             break;
         }
     const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
-    if (m < B) block_rollback(m, slot);
+    if (m < B) {
+        if (g_fast) block_rollback(m, slot);
+        else rollback(M, m, slot);
+    }
     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
-             std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0) {
+             std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot) {
     k::enable_grouped_tensor_products(allow_short_batch_products());
     const Config& c = M.c;
     const int C = c.C;
@@ -3722,8 +4036,14 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out, slot);
         return;
     }
-    if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
-    if (T == 1) g_tl.lap(g_tl.other);
+    // (kCand: run_head's candidates on this path too - g_cand for one token, rcand() for a window's rows; more than
+    //  16 rows: the logits)
+    if (out_mode == OutMode::kCand && T > 16) out_mode = OutMode::kLogits, g_cand.n = -1;
+    // (a verify window: its own timeline, started here; the next token's "between" leaves the window out)
+    Timeline& TL = g_rec && T > 1 ? g_tlw : g_tl;
+    g_tl_cur = T == 1 || g_rec ? &TL : nullptr;
+    if (&TL == &g_tlw && g_tlw.on) g_tlw.t = now();
+    if (T == 1 || g_rec) TL.lap(TL.other);
     use_dev(M.L[0].dev);
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
@@ -3757,6 +4077,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
+        if ((T == 1 || g_rec) && TL.level >= 2) {   // (IK2_TL=2: "waiting for the GPU" then is this visit's own)
+            CU(cudaStreamSynchronize(g_s));
+            TL.lap(TL.gpu_prev);
+        }
         Layer& Ly = bind_visit(M, vis, slot);
         if (Ly.dev != g_cur) {   // the next GPU's layers: the stream and the block states go along
             const int from = g_cur;
@@ -3833,7 +4157,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         const float* route_bias = Ly.probs_b;
-        if (g_x_cache_bias > 0 && T == 1 && g_pool) {   // (IK2_X_CACHE_BIAS: the experts in VRAM ranked a little higher)
+        // (IK2_X_CACHE_BIAS: the experts in VRAM ranked a little higher - a decoded token's routing, and a verify
+        //  window's (g_rec), whose tokens are decoded ones; a prompt's is the model's own)
+        if (g_x_cache_bias > 0 && (T == 1 || g_rec) && g_pool) {
             if (g_x_bias_h.empty()) g_x_bias_h.resize(c.n_layer);
             if (g_x_bias_h[l].empty()) {
                 g_x_bias_h[l].resize(c.E);
@@ -3850,14 +4176,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         // (Q8_0 experts too with IK2_CPU_Q8=1: the last layers of unsloth's UD-Q4_K_XL)
         const bool lane_q8 = g_cpu_q8 && Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
-        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 &&
+        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= (g_rec ? std::min(16, kTokSlots / c.K) : 8) &&
                               (lane_q8 || (Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4));
         double& t_cpu = g_t_cpu_f[lane_q8 ? 1 : 0];
         const double t_up = lane_q8 ? g_t_up * (34.0 / 32.0) / (36.0 / 64.0) : g_t_up;   // (the blocks' bytes a value)
         if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
-        if (T == 1) g_tl.lap(g_tl.launch_attn);
+        if (T == 1 || g_rec) TL.lap(TL.launch_attn);
+        const double tw0 = g_rec && T > 1 ? now() : 0;
         CU(cudaStreamSynchronize(g_s));
-        if (T == 1) g_tl.lap(g_tl.sync_wait);
+        if (g_rec && T > 1) g_wtl.sync += now() - tw0;
+        if (T == 1 || g_rec) TL.lap(TL.sync_wait);
         const int* top = W.route_h;
         const float* w = (const float*) (W.route_h + S);
         pop_count(l, top, S);
@@ -4122,20 +4450,24 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_mv && S <= 64) {
+        // (a verify window: up to kTokSlots picks - 16 tokens; any other call keeps the 64 of before)
+        if (g_mv && S <= (g_rec ? kTokSlots : 64)) {
             const double te0 = now();
             // the token path: each slot (token t's pick i) its expert's blob straight from the cache
             // The slots already in VRAM first, then the ones copied in now: the first group's experts run while the
             // second's blocks are on their way (the copies on a stream of their own).
-            const uint8_t* blob[64];
-            int tk[64], id[64];
-            float sg[64], su[64], wt[64];
+            const uint8_t* blob[kTokSlots];
+            int tk[kTokSlots], id[kTokSlots];
+            float sg[kTokSlots], su[kTokSlots], wt[kTokSlots];
             const uint64_t tick = ++EC.tick;
             const cudaStream_t cst = g_overlap && !g_prof ? g_cs : g_s;
             if (T == 1 && cpu_lane) EC.observe_decode(vis, l, top, S, tick);
-            const uint8_t* where[64];
-            char late[64] = {};
-            int slot_of[64];
+            // (a verify window's tokens are decoded ones: the policy sees each as the single-token path shows it)
+            if (T > 1 && g_rec && cpu_lane && g_win_observe)
+                for (int t = 0; t < T; ++t) EC.observe_decode(vis, l, top + t * c.K, c.K, tick);
+            const uint8_t* where[kTokSlots];
+            char late[kTokSlots] = {};
+            int slot_of[kTokSlots];
             if (++W.stamp == 0) {
                 std::fill(W.seen_stamp.begin(), W.seen_stamp.end(), 0);
                 std::fill(W.gi_stamp.begin(), W.gi_stamp.end(), 0);
@@ -4144,7 +4476,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             const uint32_t stp = W.stamp;
             lazy_poll();
             double acc_up = 0, acc_cpu = 0;
-            int urgent[64], lazy[64], fit_cand[64];
+            int urgent[kTokSlots], lazy[kTokSlots], fit_cand[kTokSlots];
             int n_urgent = 0, n_lazy = 0, n_fit_cand = 0;
             const bool skip_on = g_x_miss_skip > 0 && T == 1 && cpu_lane;
             float w_sum = 0, w_skipped = 0;
@@ -4250,11 +4582,15 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             uint8_t* pk_d = W.pack_d[ps];
             float* yh = W.y_h[ps];
             int ph = 0, pm = nh, pc = nh + nw;
-            ik2::cpu::ExpertJob jobs[64];
+            ik2::cpu::ExpertJob jobs[kTokSlots];
             const int n_jobs = S - nh - nw - n_skip;
+            // (IK2_CPU_GROUP, T > 1: the tokens of this call that picked the same CPU expert share one job - its
+            //  blocks are read from host memory once; each pick's row is the single-input kernels' bit for bit)
+            const bool cpu_group = g_cpu_group && T > 1 && n_jobs > 1;
+            int job_e[kTokSlots], n_post = 0;
             g_n_miss_skip += n_skip;
             const float w_keep = n_skip ? w_sum / std::max(1e-20f, w_sum - w_skipped) : 1.0f;
-            if (T == 1) g_tl.lap(g_tl.decide);
+            if (T == 1 || g_rec) TL.lap(TL.decide);
             const double tc0 = now();
             for (int i = 0; i < S; ++i) {
                 if (late[i] == 3) {   // (left out: a row that exists, weight 0)
@@ -4269,24 +4605,50 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 su[p] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
                 wt[i] = w[i] * w_keep * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
                 if (late[i] == 2) {
+                    const float* jx = W.x_h + (size_t) (i / c.K) * C;
+                    float* jy = yh + (size_t) (p - nh - nw) * C;   // (the pick's own row, grouped or not)
+                    if (cpu_group) {   // a later token of this call on an expert that has a job: one more input of it
+                        int g = -1;
+                        for (int q = 0; q < n_post && g < 0; ++q)
+                            if (job_e[q] == e && jobs[q].n_in < ik2::cpu::ExpertJob::kMaxIn) g = q;
+                        if (g < 0) {
+                            g = n_post++;
+                            job_e[g] = e;
+                            auto& J = jobs[g];
+                            J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
+                            J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
+                            J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
+                            J.sg = sg[p], J.su = su[p];
+                            J.q8 = lane_q8;
+                            J.n_in = 0;
+                        }
+                        auto& J = jobs[g];
+                        J.xs[J.n_in] = jx, J.ys[J.n_in] = jy;
+                        if (J.n_in++ == 0) J.x = jx, J.y = jy;
+                        continue;
+                    }
                     auto& J = jobs[p - nh - nw];
                     J.gate = Ly.host[0] + (size_t) e * Ly.stride[0];
                     J.up = Ly.host[1] + (size_t) e * Ly.stride[1];
                     J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
-                    J.x = W.x_h + (size_t) (i / c.K) * C;
+                    J.x = jx;
                     J.sg = sg[p], J.su = su[p];
                     J.q8 = lane_q8;
-                    J.y = yh + (size_t) (p - nh - nw) * C;
+                    J.y = jy;
                     ik2::cpu::post_expert(*g_pool, &J, C, c.F, c.gate_cap, c.up_cap);
                 }
+            }
+            if (cpu_group) {   // (posted once each is whole: the workers start on a job as it is posted)
+                for (int q = 0; q < n_post; ++q) ik2::cpu::post_expert(*g_pool, &jobs[q], C, c.F, c.gate_cap, c.up_cap);
+                g_n_cpu_grouped += n_jobs - n_post;
             }
             g_n_cpu += n_jobs, g_n_wait += nw;
             // the groups: a part's (0: in VRAM, 1: waited for) slots by expert, each expert's blocks read once
             int ng[2] = {0, 0};
-            const uint8_t* gb[64];
-            int gn[64];
-            int gtok[64 * k::kGroupMax];
-            int grow[64 * k::kGroupMax];
+            const uint8_t* gb[kTokSlots];
+            int gn[kTokSlots];
+            int gtok[kTokSlots * k::kGroupMax];
+            int grow[kTokSlots * k::kGroupMax];
             int G = 0;
             for (int part = 0; part < 2; ++part) {
                 if (++W.stamp == 0) {
@@ -4299,7 +4661,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     if (late[i] != part) continue;
                     const int e = top[i];
                     int g;
-                    if (W.gi_stamp[e] != gstp) {
+                    if (W.gi_stamp[e] != gstp || gn[W.gi_idx[e]] == k::kGroupMax) {   // (its first group, or its next)
                         W.gi_stamp[e] = gstp;
                         g = G++;
                         W.gi_idx[e] = g;
@@ -4316,7 +4678,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             // (IK2_CPU_SUM: the CPU lane's rows are one row, their weights the host's - see g_cpu_sum)
             const bool cpu_sum = g_cpu_sum && T == 1 && n_jobs > 1;
-            float wt_cpu[64];
+            float wt_cpu[kTokSlots];
             if (cpu_sum) {
                 bool first = true;
                 for (int i = 0; i < S; ++i) {
@@ -4328,29 +4690,34 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 }
             }
             g_pf.lap(g_pf.upload);
-            // one copy of the tables from pinned memory: [64] pointers, then tok, inv, sg, su, wt [64] each
+            // one copy of the tables from pinned memory: [pn] pointers, then tok, inv, sg, su, wt [pn] each, and the
+            // groups: [pn] pointers, n [pn], tok [pn][8], row [pn][8].  pn: 64 (6656 bytes, as before) unless the
+            // call has more picks (a verify window of 9 .. 16 tokens: kTokSlots, 13312 bytes).
+            const size_t pn = S <= 64 ? 64 : kTokSlots;
+            const size_t o_tk = pn * 8, o_id = o_tk + pn * 4, o_sg = o_id + pn * 4, o_su = o_sg + pn * 4,
+                         o_wt = o_su + pn * 4, o_gb = o_wt + pn * 4, o_gn = o_gb + pn * 8, o_gt = o_gn + pn * 4,
+                         o_gr = o_gt + pn * k::kGroupMax * 4, o_end = o_gr + pn * k::kGroupMax * 4;
             std::memcpy(pk, blob, S * sizeof(void*));
-            std::memcpy(pk + 512, tk, S * 4);
-            std::memcpy(pk + 768, id, S * 4);
-            std::memcpy(pk + 1024, sg, S * 4);
-            std::memcpy(pk + 1280, su, S * 4);
-            std::memcpy(pk + 1536, wt, S * 4);
-            // ... and the groups: [64] pointers, n [64], tok [64][8], row [64][8]
-            std::memcpy(pk + 1792, gb, G * sizeof(void*));
-            std::memcpy(pk + 2304, gn, G * 4);
-            std::memcpy(pk + 2560, gtok, (size_t) G * k::kGroupMax * 4);
-            std::memcpy(pk + 4608, grow, (size_t) G * k::kGroupMax * 4);
-            CU(cudaMemcpyAsync(pk_d, pk, 6656, cudaMemcpyHostToDevice, g_s));
-            const auto* pgb = (const uint8_t* const*) (pk_d + 1792);
-            const int* pgn = (const int*) (pk_d + 2304);
-            const int* pgt = (const int*) (pk_d + 2560);
-            const int* pgr = (const int*) (pk_d + 4608);
+            std::memcpy(pk + o_tk, tk, S * 4);
+            std::memcpy(pk + o_id, id, S * 4);
+            std::memcpy(pk + o_sg, sg, S * 4);
+            std::memcpy(pk + o_su, su, S * 4);
+            std::memcpy(pk + o_wt, wt, S * 4);
+            std::memcpy(pk + o_gb, gb, G * sizeof(void*));
+            std::memcpy(pk + o_gn, gn, G * 4);
+            std::memcpy(pk + o_gt, gtok, (size_t) G * k::kGroupMax * 4);
+            std::memcpy(pk + o_gr, grow, (size_t) G * k::kGroupMax * 4);
+            CU(cudaMemcpyAsync(pk_d, pk, o_end, cudaMemcpyHostToDevice, g_s));
+            const auto* pgb = (const uint8_t* const*) (pk_d + o_gb);
+            const int* pgn = (const int*) (pk_d + o_gn);
+            const int* pgt = (const int*) (pk_d + o_gt);
+            const int* pgr = (const int*) (pk_d + o_gr);
             const auto* pb = (const uint8_t* const*) pk_d;
-            const int* ptk = (const int*) (pk_d + 512);
-            const int* pid = (const int*) (pk_d + 768);
-            const float* psg = (const float*) (pk_d + 1024);
-            const float* psu = (const float*) (pk_d + 1280);
-            const float* pwt = (const float*) (pk_d + 1536);
+            const int* ptk = (const int*) (pk_d + o_tk);
+            const int* pid = (const int*) (pk_d + o_id);
+            const float* psg = (const float*) (pk_d + o_sg);
+            const float* psu = (const float*) (pk_d + o_su);
+            const float* pwt = (const float*) (pk_d + o_wt);
             const int F = c.F;
             // (one token: its NVFP4 experts on the tensor cores, as the resident path runs them; IK2_EXPERT_MMA=0: no)
             static const int exp_mma_c = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
@@ -4369,9 +4736,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 }
                 if (g_group && g_group_exp && T > 1) {
                     const int g0 = part ? ng[0] : 0, gc = ng[part];
+                    // (W.x16: the router's FP16 rows - with IK2_GROUP_MMA the groups run on the tensor cores, as
+                    //  the resident path's verify windows do)
                     k::experts_gate_up_swiglu_g(pgb + g0, pgn + g0, pgt + (size_t) g0 * k::kGroupMax,
                                                 pgr + (size_t) g0 * k::kGroupMax, gc, Ly.ty[0], Ly.ty[1], Ly.eb[0],
-                                                W.xq, C, F, psg, psu, c.gate_cap, c.up_cap, W.h16, g_s);
+                                                W.xq, C, F, psg, psu, c.gate_cap, c.up_cap, W.h16, g_s, W.x16);
                     k::experts_down_g(pgb + g0, pgn + g0, pgr + (size_t) g0 * k::kGroupMax, gc, Ly.ty[2],
                                       Ly.eb[0] + Ly.eb[1], W.h16, C, F, W.y32, g_s);
                     continue;
@@ -4381,16 +4750,22 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 k::experts_down(pb + p0, n, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16 + (size_t) p0 * F, C, F,
                                 W.y32 + (size_t) p0 * C, g_s);
             }
-            if (T == 1) g_tl.lap(g_tl.launch_hits);
-            if (T == 1 && g_tl.level >= 2) {   // (IK2_TL=2: how long the GPU's own experts of this visit take)
+            if (T == 1 || g_rec) TL.lap(TL.launch_hits);
+            if ((T == 1 || g_rec) && TL.level >= 2) {   // (IK2_TL=2: how long the GPU's own experts of this visit take)
                 CU(cudaStreamSynchronize(g_s));
-                g_tl.lap(g_tl.gpu_hits);
+                TL.lap(TL.gpu_hits);
             }
+            if (g_rec && T > 1)
+                g_wtl.hit += nh, g_wtl.waited += nw, g_wtl.cpu += n_jobs, g_wtl.lazy += n_lazy,
+                    g_wtl.cpu_jobs += cpu_group ? n_post : n_jobs;
             if (n_jobs > 0) {
+                const double tw1 = g_rec && T > 1 ? now() : 0;
                 g_pool->wait();
-                if (T == 1) g_tl.lap(g_tl.pool_wait);
+                if (g_rec && T > 1) g_wtl.pool += now() - tw1;
+                if (T == 1 || g_rec) TL.lap(TL.pool_wait);
                 g_cpu_busy += now() - tc0, ++g_cpu_batches;
-                t_cpu = 0.9 * t_cpu + 0.1 * (now() - tc0) / n_jobs;
+                // (a grouped batch's time a pick is not a single token's: the lane's estimate keeps the latter)
+                if (!cpu_group || n_post == n_jobs) t_cpu = 0.9 * t_cpu + 0.1 * (now() - tc0) / n_jobs;
                 if (cpu_sum) {
                     for (int c2 = 0; c2 < C; ++c2) yh[c2] *= wt_cpu[0];
                     for (int j = 1; j < n_jobs; ++j) {
@@ -4414,7 +4789,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             g_pf.lap(g_pf.rest);
-            if (T == 1) g_tl.lap(g_tl.tail);
+            if (T == 1 || g_rec) TL.lap(TL.tail);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -4423,7 +4798,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
-    if (T == 1) g_tl.lap(g_tl.head), ++g_tl.tokens;
+    if (T == 1 || g_rec) TL.lap(TL.head), ++TL.tokens, TL.inputs += T;
+    if (&TL == &g_tlw && g_tl.on) g_tl.t = now();
 #undef W
 #undef EC
 }
@@ -4682,7 +5058,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
 }
 
 // every short conv's history as after the first n of the verify window's tokens
-void rollback(Model& M, int n, int slot = 0) {
+void rollback(Model& M, int n, int slot) {
     const int C = M.c.C, KD = M.c.KV * M.c.D;
     for (int vis = 0; vis < (int) M.V.size(); ++vis) {
         Layer& Ly = bind_visit(M, vis, slot);
@@ -4845,19 +5221,31 @@ void place_decode(Model& M, int depth) {
 
 // A repeated suffix proposes tokens already present earlier in this request. Every proposed
 // token is checked against the full target; the first mismatch supplies the next anchor.
+// On the cache path (the experts do not all fit in VRAM: g_fast off) a window is at most 16 inputs - the token
+// path's kTokSlots picks a call - and may be as short as suffix_min; the tokens of a window that picked the same
+// CPU expert share its read (IK2_CPU_GROUP).
 int suffix_window = 0;
+int suffix_match = 12;   // IK2_SUFFIX_MATCH: the tokens before the anchor a proposal's source has to repeat
+int suffix_min = 12;     // IK2_SUFFIX_MIN: the shortest window worth a forward (the cache path: 2 unless set)
+int suffix_back = 16;    // IK2_SUFFIX_BACK: after a window with a rejected proposal, the tokens without one
+// IK2_SUFFIX_CAP=S0: a window at most `cap` inputs - S0 at a request's start and after a window with a rejected
+// proposal, doubled (up to the window) after one with every proposal accepted; IK2_SUFFIX_BACK is then 0 unless set
+// (sim3.py on the recorded session: S0 = 8 with a 16-input window the best of the simple rules)
+int suffix_cap0 = 0;
 struct SuffixStats {
     int forwards = 0;
     int inputs = 0;
     int offered = 0;
     int accepted = 0;
+    int cap = 0;          // (IK2_SUFFIX_CAP: this request's)
 };
-using RowSampler = std::function<int(const float*)>;
+// the token picked from a window's row j of logits (row j: what follows the window's input j)
+using RowSampler = std::function<int(const float*, int)>;
 int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remaining, const std::vector<int>& stops,
                   std::vector<int>& next, double& t_exp, SuffixStats& stats, const RowSampler& sample = {}) {
-    constexpr int match = 12;
+    const int match = suffix_match;
     const int end = (int)hist.size();
-    if (!g_fast || !suffix_window || remaining < match || end < 2 * match) return 0;
+    if (!suffix_window || remaining < suffix_min || end < 2 * match) return 0;
     int src = end - match;
     const int floor = std::max(match - 1, end - 65536);
     for (; src >= floor; --src) {
@@ -4869,20 +5257,23 @@ int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remain
     int matched = match;
     while (matched < suffix_window && src >= matched && hist[src - matched] == hist[end - matched])
         ++matched;
-    const int n = std::min({suffix_window, remaining, end - src, 2 * matched - 8});
-    if (n < match) return 0;
+    int n = std::min({suffix_window, remaining, end - src, std::max(suffix_min, 2 * matched - 8)});
+    if (suffix_cap0) n = std::min(n, stats.cap ? stats.cap : suffix_cap0);
+    if (n < suffix_min) return 0;
     std::vector<float> logits;
     std::vector<int> predicted;
     ++stats.forwards;
     stats.offered += n - 1;
     g_rec = true;
+    const double tw = now();
     forward(M, hist.data() + src, n, end, true, sample ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits,
             &predicted, t_exp);
     g_rec = false;
+    g_wtl.total += now() - tw, ++g_wtl.calls, g_wtl.tokens += n;
     // Sample from the target once per committed next token. No random numbers
     // are consumed for positions beyond a rejected proposal.
     for (int i = 0; i < n; ++i) {
-        const int picked = sample ? sample(logits.data() + (size_t)i * M.c.n_vocab) : predicted[i];
+        const int picked = sample ? sample(logits.data() + (size_t)i * M.c.n_vocab, i) : predicted[i];
         next.push_back(picked);
         if (i + 1 == n || picked != hist[src + i + 1]) break;
         ++stats.accepted;
@@ -4890,8 +5281,33 @@ int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remain
     }
     const int used = (int)next.size();
     stats.inputs += used;
-    if (used < n) rollback(M, used);
+    static const bool log_win = getenv("IK2_SUFFIX_LOG") != nullptr;   // (a measurement switch: each window)
+    if (log_win) std::fprintf(stderr, "SFXWIN %d %d %d\n", end, n, used);
+    if (suffix_cap0) stats.cap = used == n ? std::min(suffix_window, 2 * (stats.cap ? stats.cap : suffix_cap0)) : suffix_cap0;
+    // IK2_SUFFIX_REDO=1 (a check of rollback): the window taken back whole and its kept inputs run again one at a
+    // time - with an exact rollback every row after the window is the plain path's bit for bit
+    static const bool redo = getenv("IK2_SUFFIX_REDO") && atoi(getenv("IK2_SUFFIX_REDO"));
+    if (redo) {
+        rollback(M, 0);
+        std::vector<float> lo;
+        std::vector<int> ag;
+        for (int j = 0; j < used; ++j)
+            forward(M, hist.data() + src + j, 1, end + j, false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+    } else if (used < n)
+        rollback(M, used);
     return used;
+}
+
+void print_window_timeline() {
+    if (!g_wtl.calls || g_fast) return;
+    const double n = (double) g_wtl.calls;
+    std::fprintf(stderr,
+                 "suffix windows: %llu, %.2f inputs each, %.1f ms each (waiting for the GPU before the routing %.1f, "
+                 "for the CPU lane %.1f); picks a window: %.0f in VRAM, %.0f waited for, %.0f on the CPU in %.0f jobs, "
+                 "%.1f lazy copies\n",
+                 g_wtl.calls, g_wtl.tokens / n, g_wtl.total * 1e3 / n, g_wtl.sync * 1e3 / n, g_wtl.pool * 1e3 / n,
+                 g_wtl.hit / n, g_wtl.waited / n, g_wtl.cpu / n, g_wtl.cpu_jobs / n, g_wtl.lazy / n);
+    g_wtl = WinTl{};
 }
 
 // the embedding row of token t, normed as the model's input, into out (device [C])
@@ -4998,6 +5414,7 @@ int main(int argc, char** argv) {
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_tl.on = getenv("IK2_TL") && std::atoi(getenv("IK2_TL"));
     g_tl.level = getenv("IK2_TL") ? std::atoi(getenv("IK2_TL")) : 0;
+    g_tlw.on = g_tl.on, g_tlw.level = g_tl.level;
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
@@ -5005,12 +5422,18 @@ int main(int argc, char** argv) {
         const int v = std::atoi(getenv("IK2_GROUP"));
         g_group_exp = v == 1 || v >= 3, g_group_attn = v >= 2;
     }
+    if (getenv("IK2_ATTN_MULTI")) g_attn_multi_max = std::clamp(std::atoi(getenv("IK2_ATTN_MULTI")), 1, 16);
     g_dense_q8 = getenv("IK2_DENSE") && std::string(getenv("IK2_DENSE")) == "q8";
     if (const char* d4 = getenv("IK2_DENSE4")) {
         const std::string v = d4;
         g_dense4 = v == "head" ? 1 : v == "attn" ? 2 : v == "all" ? 3 : v == "" || v == "0" ? 0 : -1;
         if (g_dense4 < 0) die("IK2_DENSE4 must be head, attn or all");
         if (g_dense4 && !g_dense_q8) die("IK2_DENSE4 needs IK2_DENSE=q8");
+    }
+    if (const char* f = getenv("IK2_DENSE4_FILE")) {
+        if (!(g_dense4 & 2)) die("IK2_DENSE4_FILE needs IK2_DENSE4=attn or all");
+        g_d4_path = f;
+        d4_file_read(g_d4_path);
     }
     if (getenv("IK2_KV")) {
         const std::string kv = getenv("IK2_KV");
@@ -5097,7 +5520,6 @@ int main(int argc, char** argv) {
                     c.core1 - 1, c.n_pass, c.n_visit, c.rank);
         // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
         if (!draft_path.empty() && (c.C != 2304 || c.n_visit != 48)) die("--draft: a looped model other than Inkling-2-Mini");
-        if (!draft_path.empty() && g_dense4) die("IK2_DENSE4: not with --draft");
     }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
     g_tp_F = c.F, g_tp_C = c.C;
@@ -5190,6 +5612,8 @@ int main(int argc, char** argv) {
     g_lazy_per = getenv("IK2_LAZY_PER") ? std::atoi(getenv("IK2_LAZY_PER")) : 0;
     g_lazy_fit = getenv("IK2_LAZY_FIT_MS") ? std::atof(getenv("IK2_LAZY_FIT_MS")) * 1e-3 : 0;
     g_cpu_sum = !getenv("IK2_CPU_SUM") || std::atoi(getenv("IK2_CPU_SUM"));
+    g_cpu_group = !getenv("IK2_CPU_GROUP") || std::atoi(getenv("IK2_CPU_GROUP"));
+    g_win_observe = !getenv("IK2_WIN_OBSERVE") || std::atoi(getenv("IK2_WIN_OBSERVE"));
     g_x_cache_bias = getenv("IK2_X_CACHE_BIAS") ? (float) std::atof(getenv("IK2_X_CACHE_BIAS")) : 0.0f;
     g_lazy_after = getenv("IK2_LAZY_AFTER") && std::atoi(getenv("IK2_LAZY_AFTER"));
     g_x_miss_skip = getenv("IK2_X_MISS_SKIP") ? std::clamp((float) std::atof(getenv("IK2_X_MISS_SKIP")), 0.0f, 0.12f) : 0.0f;
@@ -5357,6 +5781,9 @@ int main(int argc, char** argv) {
         Ly.dev = dual() ? 0 : l * n_gpu / c.n_layer;
         use_dev(Ly.dev);
         Ly.sliding = c.sliding[l];
+        // (IK2_DENSE4=attn|all: this layer's attention matrices as NVFP4 - every layer, or IK2_DENSE4_LAYERS's, e.g.
+        //  "0-4,18-23": a layer's error and bytes are not alike - the looped ones run three times a token)
+        const bool a4 = (g_dense4 & 2) && d4_layer(l);
         auto sink_v = host_f32(S, b + "attn_sink_proj.weight", (size_t) c.H * C);
         if (Ly.sliding) {
             std::vector<MatPart> qkv_parts = {
@@ -5370,7 +5797,7 @@ int main(int argc, char** argv) {
                 qkv_parts.push_back({"", c.H, std::move(sink_v)});
                 Ly.wqkvrg = load_fused_f16(S, qkv_parts, (int) C);
             } else {
-                if (!try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg, g_dense4 & 2)) {
+                if (!try_load_fused_raw(S, qkv_parts, (int) C, Ly.wqkvrg, a4)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C);
                     Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C);
@@ -5395,19 +5822,22 @@ int main(int argc, char** argv) {
                 Ly.wv_dyn = load_fused_f16(S, {{b + "attn_v.weight", (int) KD, {}}, {"", c.KV * 4, std::move(vd_v)}},
                                            (int) C);
             } else {
-                if (!try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg, g_dense4 & 2)) {
+                if (!try_load_fused_raw(S, qrg_parts, (int) C, Ly.wqrg, a4)) {
                     Ly.wq = load_mat(S, b + "attn_q.weight", (int) HD, (int) C);
                     Ly.wr = load_mat(S, nm(b, "attn_r.weight"), c.H * c.d_rel, (int) C);
                     Ly.wgate = load_mat(S, b + "attn_gate.weight", (int) HD, (int) C);
                 }
-                Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C, g_dense4 & 2);
-                Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C, g_dense4 & 2);
+                Ly.wk = load_mat(S, b + "attn_k.weight", (int) KD, (int) C, a4);
+                Ly.wv = load_mat(S, b + "attn_v.weight", (int) KD, (int) C, a4);
                 Ly.sink16 = dev_f16(sink_v);
                 Ly.sc_k_dyn16 = dev_f16(kd_v);
                 Ly.sc_v_dyn16 = dev_f16(vd_v);
             }
         }
-        Ly.wo = load_mat(S, b + "attn_output.weight", (int) C, (int) HD, g_dense4 & 2);
+        // (IK2_DENSE4_KEEP_O=1: attn_output stays the file's Q8_0 - the largest share of the NVFP4 error, a quarter of
+        //  the attention's bytes)
+        static const bool keep_o = getenv("IK2_DENSE4_KEEP_O") && atoi(getenv("IK2_DENSE4_KEEP_O"));
+        Ly.wo = load_mat(S, b + "attn_output.weight", (int) C, (int) HD, a4 && !keep_o);
         Ly.router16 = load_f16(S, b + "ffn_gate_inp.weight", (size_t) c.E * C);
         Ly.probs_b = load_f32(S, b + "exp_probs_b.bias", c.E);
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
@@ -5761,7 +6191,18 @@ int main(int argc, char** argv) {
             draft_head = dalloc<uint16_t>(n);
             k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
         }
-        if (!draft_head) die("--draft: the output head is neither FP16 nor planar Q8_0");
+        const bool head_nv = !draft_head && M.out_w.type == k::kNVFP4 && M.out_w.raw;
+        if (head_nv) {   // (IK2_DENSE4=head: the fold's FP16 head from the file's own blocks, freed after the fold)
+            const auto* t = S.info("output.weight");
+            if (!t) die("--draft: no output.weight");
+            const size_t n = (size_t) c.n_rows * c.C, nb = tensor_bytes(*t);
+            ensure_stage(nb);
+            CU(cudaMemcpy(g_stage, S.data("output.weight"), nb, cudaMemcpyHostToDevice));
+            draft_head = dalloc<uint16_t>(n);
+            k::decode_f16((int) t->type, g_stage, n, draft_head, g_s);
+            CU(cudaStreamSynchronize(g_s));
+        }
+        if (!draft_head) die("--draft: the output head is neither FP16, planar Q8_0 nor NVFP4");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         const double t0 = now();
         try {
@@ -5769,6 +6210,14 @@ int main(int argc, char** argv) {
             ik2::draft::fold(drafter, draft_head, c.n_rows);
         } catch (const std::exception& e) {
             die(e.what());
+        }
+        if (head_nv) {   // (the base logits through the NVFP4 head; the FP16 copy and the stage were the fold's)
+            ik2::draft::set_head_nvfp4(drafter, M.out_w.raw, M.out_w.scale);
+            CU(cudaStreamSynchronize(g_s));
+            CU(cudaFree(draft_head));
+            draft_head = nullptr;
+            CU(cudaFree(g_stage));
+            g_stage = nullptr, g_stage_bytes = 0;
         }
         if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
             ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
@@ -5791,12 +6240,34 @@ int main(int argc, char** argv) {
 
     if (getenv("IK2_SUFFIX") && n_gpu == 1 && g_fast_want && !drafter)
         suffix_window = std::min({std::max(0, atoi(getenv("IK2_SUFFIX"))), chunk, 128});
-    if (suffix_window >= 8) {
+    // (the cache path: the CPU lane takes 8 tokens a call, and a window may be short - see verify_suffix)
+    // (with --draft too: a window copies when the request repeats itself, the drafter fills in elsewhere)
+    const bool suffix_cache = getenv("IK2_SUFFIX") && n_gpu == 1 && !g_fast_want && g_parallel <= 1;
+    if (suffix_cache) {
+        suffix_window = std::min({std::max(0, atoi(getenv("IK2_SUFFIX"))), chunk, std::min(16, kTokSlots / c.K)});
+        suffix_min = 2;
+    }
+    if (getenv("IK2_SUFFIX_MIN")) suffix_min = std::max(2, atoi(getenv("IK2_SUFFIX_MIN")));
+    if (getenv("IK2_SUFFIX_MATCH")) suffix_match = std::max(2, atoi(getenv("IK2_SUFFIX_MATCH")));
+    if (const char* d = getenv("IK2_COV_OUT")) {   // (the GPTQ calibration's second moments, see cov_add)
+        g_cov.dir = d, g_cov.l0 = 0, g_cov.l1 = c.n_layer - 1;
+        if (const char* r = getenv("IK2_COV_LAYERS")) std::sscanf(r, "%d-%d", &g_cov.l0, &g_cov.l1);
+        g_cov.h.assign(c.n_layer, {}), g_cov.n.assign(c.n_layer, {}), g_cov.k.assign(c.n_layer, {});
+    }
+    // (the cache path with a window over 8: S0 = 8 unless set - the recorded session 48.13 tok/s against 47.55 with
+    //  a fixed 8 and 47.45 with a fixed 16)
+    if (suffix_cache && suffix_window > 8) suffix_cap0 = 8;
+    if (getenv("IK2_SUFFIX_CAP")) suffix_cap0 = std::max(0, atoi(getenv("IK2_SUFFIX_CAP")));
+    if (suffix_cap0) suffix_back = 0;
+    if (getenv("IK2_SUFFIX_BACK")) suffix_back = std::max(0, atoi(getenv("IK2_SUFFIX_BACK")));
+    if (suffix_window >= (suffix_cache ? 2 : 8)) {
         for (auto& v : M.V) {
             const size_t cc[] = {KD, KD, C, C};
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 4; ++j) {   // (beside the drafter: room for its windows too)
+                if (v.rec_old[j]) CU(cudaFree(v.rec_old[j]));
+                if (v.rec_x[j]) CU(cudaFree(v.rec_x[j]));
                 v.rec_old[j] = dalloc<float>(3 * cc[j]);
-                v.rec_x[j] = dalloc<float>((size_t)suffix_window * cc[j]);
+                v.rec_x[j] = dalloc<float>((size_t) std::max(suffix_window, drafter ? ik2::draft::kBlock : 0) * cc[j]);
             }
         }
         std::printf("suffix verification: up to %d inputs per target forward\n", suffix_window);
@@ -5831,7 +6302,7 @@ int main(int argc, char** argv) {
     W.rr = work_alloc<float>(Tm * c.H * c.d_rel), W.sink = work_alloc<float>(Tm * c.H);
     W.dyn =
         work_alloc<float>(2 * Tm * c.KV * 4); // (a full layer's dynamic taps: k's, and on the resident path v's beside)
-    W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
+    W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 16 * c.H * 128 * 130, (size_t) 64 << 20);
     const bool flash_only = g_flash && c.D == 128 && (!getenv("IK2_RELB") || atoi(getenv("IK2_RELB")));
     if (flash_only && g_fast_want) W.lg_cap = std::max((size_t)64 << 20, (size_t)8 * c.H * 128 * 130);
     W.lg = work_alloc<float>(W.lg_cap, 72ULL << 20);
@@ -5852,7 +6323,7 @@ int main(int argc, char** argv) {
     W.rlog = work_alloc<float>(T_buf * c.E), W.route_d = work_alloc<int>(S_buf * 2);
     W.ex16 = work_alloc<uint16_t>(T_buf * C),
     W.w16 = work_alloc<uint16_t>((size_t)2 * c.F * C); // (one expert's tokens)
-    W.h16 = work_alloc<uint16_t>(std::max<size_t>(64, T_buf) * c.F);
+    W.h16 = work_alloc<uint16_t>(std::max<size_t>(kTokSlots, T_buf) * c.F);   // (the token path: kTokSlots picks)
     W.gu32_bytes = 4 * std::max({S8 * 2 * (size_t) c.F,
                   Tm * std::max<size_t>(2 * HD + 2 * KD + (size_t) c.H * c.d_rel + c.H,
                                         (2 * HD + (size_t) c.H * c.d_rel + c.H) + 2 * (KD + (size_t) c.KV * 4)),
@@ -5860,7 +6331,7 @@ int main(int argc, char** argv) {
     W.gu32 = work_alloc<float>(W.gu32_bytes / 4);
     W.qkv = W.gu32;
     W.lg16 = (uint16_t*) W.gu32;
-    W.y32 = work_alloc<float>(std::max<size_t>(64, T_buf) * C);
+    W.y32 = work_alloc<float>(std::max<size_t>(kTokSlots, T_buf) * C);
     if (g_tp)
         W.tp_h = work_alloc<uint16_t>(std::max<size_t>(64, S_buf) *
                                       c.F); // (one expert's tokens; the token path's <= 64 rows)
@@ -5869,9 +6340,9 @@ int main(int argc, char** argv) {
     W.gidx = work_alloc<int>(S_buf), W.inv = work_alloc<int>(S_buf);
     W.blob = work_alloc<const uint8_t*>(S8), W.tok = work_alloc<int>(S8);
     for (int i = 0; i < Work::kPackRing; ++i) {
-        CU(cudaHostAlloc(&W.pack_h[i], 8192, cudaHostAllocPortable));
-        W.pack_d[i] = work_alloc<uint8_t>(8192);
-        if (g_pool) CU(cudaHostAlloc(&W.y_h[i], (size_t) 64 * C * 4, cudaHostAllocPortable));
+        CU(cudaHostAlloc(&W.pack_h[i], 16384, cudaHostAllocPortable));
+        W.pack_d[i] = work_alloc<uint8_t>(16384);
+        if (g_pool) CU(cudaHostAlloc(&W.y_h[i], (size_t) kTokSlots * C * 4, cudaHostAllocPortable));
     }
     W.T_host = (int) std::max<size_t>(T_buf, W.T_sup > 0 ? (size_t) ctx : 0);   // (a lent scratch can take up to ctx)
     const size_t S_host = (size_t) W.T_host * c.K;
@@ -5883,7 +6354,7 @@ int main(int argc, char** argv) {
         CU(cudaHostAlloc(&W.wt_h[i], S_host * 4, cudaHostAllocPortable));
         CU(cudaHostAlloc(&W.wtr_h[i], S_host * 4, cudaHostAllocPortable));
     }
-    CU(cudaHostAlloc(&W.x_h, (size_t) 8 * C * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&W.x_h, (size_t) 16 * C * 4, cudaHostAllocPortable));   // (a verify window's 16 tokens)
     CU(cudaHostAlloc(&W.emb_h, Tm * C * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.pos_h, (size_t) W.T_host * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.route_h, S_host * 8, cudaHostAllocPortable));
@@ -5972,8 +6443,8 @@ int main(int argc, char** argv) {
                     EC.pools[p].slot_bytes / 1048576.0,
                     (double) EC.pools[p].n_slots * EC.pools[p].slot_bytes / 1073741824.0, EC.pools[p].n_layers);
     if (getenv("IK2_KV_LEND") && std::atoi(getenv("IK2_KV_LEND")) && d == 0) {
-        if (n_gpu != 1 || g_parallel > 1 || g_kv_managed || g_fast_want || g_tp || g_ep || drafter)
-            die("IK2_KV_LEND needs one GPU with the expert cache (not the resident path), one slot, no drafter");
+        if (n_gpu != 1 || g_parallel > 1 || g_kv_managed || g_fast_want || g_tp || g_ep)
+            die("IK2_KV_LEND needs one GPU with the expert cache (not the resident path), one slot");
         std::vector<uint8_t*> arrs;
         size_t arr_bytes = 0;
         const size_t row_bytes = KD * (g_kv_fp8 ? 1 : 2);
@@ -7263,8 +7734,16 @@ int main(int argc, char** argv) {
         // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
         // widest window, IK2_DRAFT_ADAPT=0 always that wide
         SpecCtl sctl;
-        const bool spec_on = drafter && g_fast && g_block;
-        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        // (the cache path too: spec_step's window through forward(); a copy window goes first when the request
+        //  repeats itself)
+        const bool spec_on = drafter && (g_fast ? g_block : true);
+        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : g_fast ? 5 : 8;
+        if (!g_fast) {   // (the controller's priors: measured on the cache path, RTX 4060 8 GB, 131072 context -
+                         //  a plain token 24.4 ms, a window of b inputs, the drafting's 8.5 ms with it)
+            const double win[kBlockMax + 1] = {0, 0, 36.7, 41.3, 45.8, 49.7, 53.6, 57.2, 60.8};
+            sctl.c_plain = 24.4e-3;
+            for (int b = 2; b <= kBlockMax; ++b) sctl.c[b] = (win[b] + 8.5) * 1e-3;
+        }
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         while (next_line(line)) {
             std::istringstream in(line);
@@ -7528,7 +8007,15 @@ int main(int argc, char** argv) {
             int n_out = 0;
             int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
             int pending_sample = -1;
-            const RowSampler suffix_sample = temp > 0 ? RowSampler(pick) : RowSampler{};
+            // (a forced request - IK2_FORCE_Q - "picks" its own tokens: a window's proposals are checked against them)
+            int suffix_base = 0;   // the request's token a window's row 0 picks
+            const RowSampler suffix_sample =
+                !forced.empty() ? RowSampler([&](const float* r, int j) {
+                    const int at = suffix_base + j;
+                    return at < (int) forced.size() ? forced[at] : pick(r);
+                })
+                : temp > 0 ? RowSampler([&](const float* r, int) { return pick(r); })
+                           : RowSampler{};
             int suffix_at = 0;
             SuffixStats suffix_stats;
             size_t next_placement = hist.size() + kPlacementInterval;
@@ -7568,8 +8055,13 @@ int main(int argc, char** argv) {
                 ++meas_fw;
                 if (suffix_window && i >= suffix_at) {
                     std::vector<int> next;
+                    suffix_base = i + 1;
                     const int n =
                         verify_suffix(M, hist, tok, max_new - i - 1, stops, next, t_exp, suffix_stats, suffix_sample);
+                    if (n && spec_on) {   // (the drafter's context for the kept positions: their taps)
+                        ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) hist.size());
+                        ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                    }
                     if (n) {
                         hist.push_back(tok);
                         if (g_cancel) {
@@ -7590,7 +8082,8 @@ int main(int argc, char** argv) {
                         else
                             pending_sample = next.back();
                         last.clear();
-                        if (n < 8) suffix_at = i + 16;
+                        cand = false;
+                        if (n < std::min(8, suffix_window)) suffix_at = i + suffix_back;
                         continue;
                     }
                 }
@@ -7598,6 +8091,7 @@ int main(int argc, char** argv) {
                 if (B >= 2) {
                     SampleCfg sc;
                     sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng;
+                    if (!forced.empty() && !g_fast) sc.forced = &forced, sc.forced_at = i + 1;
                     std::vector<int> next;
                     const double ts = now();
                     spec_step(M, drafter, tok, (int) hist.size(), B, sc, stops, next);
@@ -7646,6 +8140,7 @@ int main(int argc, char** argv) {
             if (suffix_stats.forwards)
                 std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
                              suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
+            if (getenv("IK2_STATS")) print_window_timeline();
             if (spec_on && getenv("IK2_STATS"))
                 std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
                              (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
@@ -7758,11 +8253,24 @@ int main(int argc, char** argv) {
     // IK2_LOGITS_OUT=FILE: every generated token's logits [n_vocab] F32 appended there (with IK2_FORCE: two builds'
     // logits over the same tokens, to compare)
     FILE* lo = getenv("IK2_LOGITS_OUT") ? std::fopen(getenv("IK2_LOGITS_OUT"), "wb") : nullptr;
-    const bool use_suffix = suffix_window && !lo && force.empty() && !drafter;
+    // (with IK2_FORCE / IK2_LOGITS_OUT a window's rows are sampled here: the forced token, the row written)
+    const bool use_suffix = suffix_window && !drafter && ((!lo && force.empty()) || !g_fast);
     std::vector<int> suffix_hist;
     if (use_suffix) suffix_hist = prompt;
     int suffix_at = 0;
     SuffixStats suffix_stats;
+    int suffix_base = 0;
+    bool best_counted = false;   // the agreement of `best` with the forced token is already in `agree`
+    const RowSampler cli_sample = (lo || !force.empty()) ? RowSampler([&](const float* r, int j) {
+        const int at = suffix_base + j;
+        const int am = (int) (std::max_element(r, r + c.n_vocab) - r);
+        if (lo) std::fwrite(r, sizeof(float), (size_t) c.n_vocab, lo);
+        if (at < (int) force.size()) {
+            agree += am == force[at];
+            return force[at];
+        }
+        return am;
+    }) : RowSampler{};
     int next_placement = kPlacementInterval;
     for (int i = 0, best = first_best; i < gen && !drafter; ++i) {
         if (g_managed_experts && i >= next_placement) {
@@ -7770,15 +8278,18 @@ int main(int argc, char** argv) {
             next_placement = i + kPlacementInterval;
         }
         const int tok = i < (int) force.size() ? force[i] : best;
-        if (i < (int) force.size()) agree += best == force[i];
+        if (i < (int) force.size() && !best_counted) agree += best == force[i];
+        best_counted = false;
         out.push_back(tok);
         std::printf("%d%s", tok, i + 1 < gen ? "," : "\n");
         std::fflush(stdout);
         if (i + 1 == gen) break;
         if (use_suffix) {
             std::vector<int> next;
-            const int n =
-                i < suffix_at ? 0 : verify_suffix(M, suffix_hist, tok, gen - i - 1, {}, next, t_exp, suffix_stats);
+            suffix_base = i + 1;
+            const int n = i < suffix_at ? 0
+                                        : verify_suffix(M, suffix_hist, tok, gen - i - 1, {}, next, t_exp, suffix_stats,
+                                                        cli_sample);
             suffix_hist.push_back(tok);
             if (n) {
                 for (int j = 0; j < n - 1; ++j) {
@@ -7788,7 +8299,8 @@ int main(int argc, char** argv) {
                 }
                 i += n - 1;
                 best = next.back();
-                if (n < 8) suffix_at = i + 16;
+                best_counted = (bool) cli_sample;
+                if (n < std::min(8, suffix_window)) suffix_at = i + suffix_back;
                 continue;
             }
         }
@@ -7812,6 +8324,7 @@ int main(int argc, char** argv) {
     if (suffix_stats.forwards)
         std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
                      suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
+    if (getenv("IK2_STATS")) print_window_timeline();
     SpecCtl ctl;
     if (drafter && g_fast && g_block) {
         // (the resident path: the controller picks plain tokens or a window; greedy, as the CLI's generation is)
@@ -7855,6 +8368,12 @@ int main(int argc, char** argv) {
         const int width = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, ik2::draft::kBlock)
                                                     : ik2::draft::kBlock;
         const bool margin_check = getenv("IK2_MARGIN") != nullptr;
+        // IK2_DRAFT_PROBS=1 (a measurement switch): the target's probability of each draft at temperature 1 (its
+        // softmax over the row), and the tokens a step would give with sampling - 1 + p0 + p0 p1 + ... along the
+        // drafts (a draft that is a point mass is kept with the target's probability of it)
+        const bool draft_probs = getenv("IK2_DRAFT_PROBS") != nullptr;
+        double dp_exp = 0, dp_sum = 0, dp_w[ik2::draft::kBlock + 1] = {};   // (dp_w[w]: a step of w, summed)
+        long dp_n = 0, dp_steps = 0;
         while ((int) out.size() < gen && P < ctx) {
             const int B = std::min(width, ctx - P);
             const double t0 = now();
@@ -7868,7 +8387,7 @@ int main(int argc, char** argv) {
             g_rec = true;
             logits.clear();
             std::vector<int> ag;
-            const bool need_logits = n_steps < verify_check || margin_check;
+            const bool need_logits = n_steps < verify_check || margin_check || draft_probs;
             const bool use_block = g_fast && g_block && !need_logits;
             if (use_block && n_steps < block_check) {
                 // (IK2_BLOCK_CHECK=n: the first n windows through both paths, their logits compared; forward()'s
@@ -7948,6 +8467,20 @@ int main(int argc, char** argv) {
                         std::printf("near tie at position %d: %d %.4f, %d %.4f\n", P + j, i1, b1, i2, b2);
                 }
             }
+            if (draft_probs) {
+                double run = 1, e = 1;
+                for (int j = 0; j + 1 < B; ++j) {
+                    const float* r = logits.data() + (size_t) j * c.n_vocab;
+                    const float mx = *std::max_element(r, r + c.n_vocab);
+                    double z = 0;
+                    for (int v = 0; v < c.n_vocab; ++v) z += std::exp((double) r[v] - mx);
+                    const double pj = std::exp((double) r[dr[j]] - mx) / z;
+                    dp_sum += pj, ++dp_n;
+                    run *= pj, e += run;
+                    dp_w[j + 2] += e;
+                }
+                dp_exp += e, ++dp_steps;
+            }
             int n = 0;
             while (n < B - 1 && dr[n] == g[n]) ++n;
             if (n + 1 < B) {
@@ -7966,6 +8499,15 @@ int main(int argc, char** argv) {
             t_verify += now() - t1;
         }
         for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
+        if (draft_probs && dp_steps)
+            std::printf("draft probabilities: %ld drafts, the target's mean probability of a draft %.3f; a step of %d "
+                        "would give %.2f tokens with sampling at temperature 1 (greedy: %.2f)\n",
+                        dp_n, dp_sum / dp_n, width, dp_exp / dp_steps, (double) (out.size() - 1) / std::max(1, n_steps));
+        if (draft_probs && dp_steps) {
+            std::printf("draft probabilities: tokens a step with sampling by width:");
+            for (int w = 2; w <= width; ++w) std::printf(" %d: %.2f", w, dp_w[w] / dp_steps);
+            std::printf("\n");
+        }
     }
     const double gen_s = now() - tg;
     if (drafter && (ctl.steps || ctl.plain)) {
@@ -7984,6 +8526,7 @@ int main(int argc, char** argv) {
         for (int j = 0; j < ik2::draft::kBlock; ++j) std::printf("%d%s", acc_hist[j], j + 1 < ik2::draft::kBlock ? " " : "");
         std::printf("); drafting %.1f ms a step, verifying %.1f ms\n", t_draft * 1e3 / n_steps, t_verify * 1e3 / n_steps);
     }
+    cov_write();
     if (g_pool)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
@@ -8000,11 +8543,24 @@ int main(int argc, char** argv) {
     if (g_tl.on && g_tl.tokens)
         std::printf("timeline, ms a token over %ld tokens: launching attention %.2f, waiting for the GPU %.2f, cache "
                     "decisions and copies %.2f, launching the hits %.2f, waiting for the CPU lane %.2f, tail %.2f, "
-                    "head %.2f, between tokens %.2f, the GPU's experts (IK2_TL=2) %.2f\n",
+                    "head %.2f, between tokens %.2f, the GPU's experts (IK2_TL=2) %.2f, the previous visit's GPU work %.2f; "
+                    "the head's wait %.2f, product %.2f, copy %.2f\n",
                     g_tl.tokens, g_tl.launch_attn * 1e3 / g_tl.tokens, g_tl.sync_wait * 1e3 / g_tl.tokens,
                     g_tl.decide * 1e3 / g_tl.tokens, g_tl.launch_hits * 1e3 / g_tl.tokens,
                     g_tl.pool_wait * 1e3 / g_tl.tokens, g_tl.tail * 1e3 / g_tl.tokens, g_tl.head * 1e3 / g_tl.tokens,
-                    g_tl.other * 1e3 / g_tl.tokens, g_tl.gpu_hits * 1e3 / g_tl.tokens);
+                    g_tl.other * 1e3 / g_tl.tokens, g_tl.gpu_hits * 1e3 / g_tl.tokens, g_tl.gpu_prev * 1e3 / g_tl.tokens,
+                    g_tl.head_wait * 1e3 / g_tl.tokens, g_tl.head_mm * 1e3 / g_tl.tokens, g_tl.head_copy * 1e3 / g_tl.tokens);
+    if (g_tlw.on && g_tlw.tokens)
+        std::printf("timeline, ms a verify window over %ld windows of %.2f inputs: launching attention %.2f, waiting "
+                    "for the GPU %.2f, cache decisions and copies %.2f, launching the hits %.2f, waiting for the CPU "
+                    "lane %.2f, tail %.2f, head %.2f, the GPU's experts (IK2_TL=2) %.2f, the previous visit's GPU work %.2f; "
+                    "the head's wait %.2f, product %.2f, copy %.2f\n",
+                    g_tlw.tokens, (double) g_tlw.inputs / g_tlw.tokens, g_tlw.launch_attn * 1e3 / g_tlw.tokens,
+                    g_tlw.sync_wait * 1e3 / g_tlw.tokens, g_tlw.decide * 1e3 / g_tlw.tokens,
+                    g_tlw.launch_hits * 1e3 / g_tlw.tokens, g_tlw.pool_wait * 1e3 / g_tlw.tokens,
+                    g_tlw.tail * 1e3 / g_tlw.tokens, g_tlw.head * 1e3 / g_tlw.tokens, g_tlw.gpu_hits * 1e3 / g_tlw.tokens,
+                    g_tlw.gpu_prev * 1e3 / g_tlw.tokens, g_tlw.head_wait * 1e3 / g_tlw.tokens,
+                    g_tlw.head_mm * 1e3 / g_tlw.tokens, g_tlw.head_copy * 1e3 / g_tlw.tokens);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);

@@ -153,6 +153,8 @@ struct Drafter {
     int n_rows = 0;
     const int8_t* head_q8 = nullptr;      // the target's head as planar Q8_0 (set_head_q8): the base logits through it
     const uint16_t* head_q8d = nullptr;
+    const uint8_t* head_nv = nullptr;     // ... or as NVFP4 blocks of head / head_nv_scale (set_head_nvfp4)
+    float head_nv_scale = 1.0f;
     int* shortlist = nullptr;
     float* shortlist_scores = nullptr;
     cublasHandle_t blas;
@@ -502,6 +504,10 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
     if (d->head_q8)
         k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
+    else if (d->head_nv) {
+        if (!k::mv_nvfp4_mma(d->head_nv, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, d->head_nv_scale, d->s))
+            throw std::runtime_error("drafter: the NVFP4 head's shape");
+    }
     else
         gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
     const int shortlist_n = (n_vocab + 31) / 32;
@@ -561,5 +567,6 @@ void save_context(Drafter* d, int P, uint8_t* out) { copy_context(d, P, out, tru
 void load_context(Drafter* d, int P, const uint8_t* in) { copy_context(d, P, const_cast<uint8_t*>(in), false); }
 
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
+void set_head_nvfp4(Drafter* d, const uint8_t* blocks, float scale) { d->head_nv = blocks, d->head_nv_scale = scale; }
 
 }  // namespace ik2::draft

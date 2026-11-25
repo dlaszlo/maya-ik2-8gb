@@ -344,6 +344,27 @@ class ToolCalls(unittest.TestCase):
         smp, _ = g.sampling({"temperature": 0}, acts[0].at, 100)
         self.assertEqual(smp["repetition_penalty"], LG.LOOP_PENALTY)
 
+    def test_inkling_calls_are_tool_calls_too(self):
+        """Inkling writes a call as <|message_model|>name<|content_invoke_tool_json|>{...}<|end_message|>: a file with
+        a block several times in it keeps every token, and three calls alike stay whole."""
+        card = '<div class=\\"card\\"><h3>Title</h3><p>Some text of the card.</p></div>\\n'
+        body = '{"name":"write","args":{"content":"' + card * 12 + '","path":"index.html"}}'
+        text = "<|message_model|>write<|content_invoke_tool_json|>" + body + "<|end_message|>"
+        plain, cut = self.feed(LG.LoopGuard(), text)
+        self.assertTrue(plain and plain[0].drop > 0 and cut != text)      # (as plain text it is a loop, and is cut)
+        g = self.guard()
+        acts, kept = self.feed(g, text)
+        self.assertEqual(kept, text)
+        self.assertTrue(all(a.drop == 0 and a.kind == LG.PENALTY for a in acts))
+        self.assertFalse(g.in_tool)                                       # (<|end_message|> closed it)
+        call = '<|message_model|>read<|content_invoke_tool_json|>{"name":"read","args":{"path":"/src/main.py"}}<|end_message|>'
+        acts, kept = self.feed(self.guard(), "ok" + call * 3)
+        self.assertEqual((acts, kept.count(call)), ([], 3))
+        g = self.guard()
+        for t in chars("<|message_model|>write<|content_invoke_tool_text|>abc"):
+            g.push(t)
+        self.assertTrue(g.in_tool)
+
     def test_without_a_piece_it_is_the_plain_guard(self):
         acts, _ = self.feed(LG.ToolSafeGuard(), "x" + self.CALL * 3)
         self.assertTrue(acts and acts[0].drop > 0)

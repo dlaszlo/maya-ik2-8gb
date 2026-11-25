@@ -234,13 +234,16 @@ class LoopGuard:
 
 # ------------------------------------------------------------------ never inside a tool call
 # A tool call is written as text between the family's markers - `<tool_call>` ... `</tool_call>` (GLM, and MiniMax with
-# its namespace in front), DeepSeek's `<｜DSML｜ calls>` ... `</｜DSML｜ calls>` - and calls that repeat (three alike in
+# its namespace in front), DeepSeek's `<｜DSML｜ calls>` ... `</｜DSML｜ calls>`, Inkling's `<|content_invoke_tool_json|>`
+# (or `..._text|>`) ... `<|end_message|>` - and calls that repeat (three alike in
 # one reply: three files read, three commands run) are legitimate: dropping "the repeats" would cut a call in half and
 # hand the client broken JSON.  So a loop whose repeated tokens touch a tool call is never cut and never closes the
 # thinking; a loop inside one call's own text (a line written again and again) only gets the short repetition
 # penalty, once a call.  Outside tool calls nothing changes.
-_TOOL_OPEN = re.compile(r"<tool_call>|<｜DSML｜\s*(?:tool_)?calls[^>]*>")
-_TOOL_CLOSE = re.compile(r"</tool_call>|</｜DSML｜\s*(?:tool_)?calls\s*>")
+# (Inkling's were missing: a file written by its `write` tool with a block three times in it - cards on a page, rows
+#  of a table - was a loop like any text's, its "repeats" dropped out of the file and the answer ended)
+_TOOL_OPEN = re.compile(r"<tool_call>|<｜DSML｜\s*(?:tool_)?calls[^>]*>|<\|content_invoke_tool_(?:json|text)\|>")
+_TOOL_CLOSE = re.compile(r"</tool_call>|</｜DSML｜\s*(?:tool_)?calls\s*>|<\|end_message\|>")
 _TAIL = 48              # the text kept to find a marker split across tokens
 
 

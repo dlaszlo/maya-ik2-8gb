@@ -26,6 +26,7 @@
 #include "ik2_cpu_deep.hpp"
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
+#include "ik2_spec_ctl.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include <array>
@@ -3874,49 +3875,11 @@ int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& r
     return d[0].first;
 }
 
-// When to draft and how wide (IK2_DRAFT_WIDTH the widest; IK2_DRAFT_ADAPT=0: always that wide): a step's expected
-// tokens (1 - a^B) / (1 - a) - a the drafts' acceptance, each accepted given the one before it, from the recent
-// steps - over its measured time, against a plain token's; a plain run drafts once in a while to look again.
-struct SpecCtl {
-    int wmax = 5;
-    bool adapt = true;
-    double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
-    double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
-    int plain_run = 0;
-    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 8;   // plain tokens before a look
-    int probe_w = 4;
-    double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
-    uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
-    uint64_t hist[kBlockMax] = {};
-    SpecCtl() {
-        const double prior[kBlockMax + 1] = {0, 7.8e-3, 13.3e-3, 15.1e-3, 16.7e-3, 18.2e-3, 19.8e-3, 21.3e-3, 22.8e-3};
-        for (int b = 0; b <= kBlockMax; ++b) c[b] = prior[b];
-    }
-    int choose(int room) {   // room: the widest a step may be (1: plain)
-        const int bmax = std::min(wmax, room);
-        if (bmax < 2) return 1;
-        if (!adapt) return bmax;
-        const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
-        int best = 1;
-        double vb = 1.0 / c_plain;
-        for (int b = 2; b <= bmax; ++b) {
-            const double e = (1.0 - std::pow(a, b)) / (1.0 - a), v = e / c[b];
-            if (v > vb) vb = v, best = b;
-        }
-        if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
-        return best;
-    }
-    void took_plain(double t) {
-        c_plain = 0.9 * c_plain + 0.1 * t;
-        ++plain, ++plain_run;
-    }
-    void took_spec(int B, int acc, double t) {
-        c[B] = 0.8 * c[B] + 0.2 * t;
-        S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
-        ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
-        plain_run = 0;
-    }
-};
+// When to draft and how wide, and the mode the model is writing in: ik2_spec_ctl.hpp (host code, tested without
+// a GPU).
+using ik2::ModeTrack;
+using ik2::SpecCtl;
+static_assert(kBlockMax == ik2::kSpecBlockMax, "ik2_spec_ctl.hpp: the widest window");
 
 // One speculative step: the anchor (the last chosen token, not run yet) at position P, B - 1 drafts after it, the B
 // verified as one window.  next: the tokens chosen after the anchor - the accepted drafts and the target's own next
@@ -7734,6 +7697,7 @@ int main(int argc, char** argv) {
         // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
         // widest window, IK2_DRAFT_ADAPT=0 always that wide
         SpecCtl sctl;
+        ModeTrack mtrack;   // (what the model is writing, off its own tokens: the controller's mode)
         // (the cache path too: spec_step's window through forward(); a copy window goes first when the request
         //  repeats itself)
         const bool spec_on = drafter && (g_fast ? g_block : true);
@@ -8024,6 +7988,7 @@ int main(int argc, char** argv) {
             const MeasSnap meas0 = meas_take();
             MeasSnap meas_w = meas0;
             int meas_fw = 0, meas_fw_w = 0;
+            if (spec_on) mtrack.begin(ids);
             for (int i = 0; i < max_new; ++i) {
                 if (meas_on && meas_win && meas_fw - meas_fw_w >= meas_win) {
                     const MeasSnap mn = meas_take();
@@ -8047,6 +8012,7 @@ int main(int argc, char** argv) {
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
+                if (spec_on) mtrack.see(tok);
                 if (forced.empty() && std::find(stops.begin(), stops.end(), tok) != stops.end()) {
                     reason = "stop";
                     break;
@@ -8073,6 +8039,7 @@ int main(int argc, char** argv) {
                         for (int j = 0; j < n - 1; ++j) {
                             std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
                             hist.push_back(next[j]);
+                            if (spec_on) mtrack.see(next[j]);
                         }
                         std::fflush(stdout);
                         n_out += n - 1;
@@ -8087,6 +8054,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                 }
+                if (spec_on) sctl.mode = mtrack.mode(), sctl.allow = mtrack.drafts(), sctl.eager = mtrack.fixed();
                 const int B = spec_on ? sctl.choose(std::min(max_new - i - 1, ctx - (int) hist.size())) : 1;
                 if (B >= 2) {
                     SampleCfg sc;
@@ -8101,6 +8069,7 @@ int main(int argc, char** argv) {
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
                         std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
                         hist.push_back(next[j]);
+                        mtrack.see(next[j]);
                     }
                     std::fflush(stdout);
                     n_out += (int) next.size() - 1;
@@ -8141,10 +8110,25 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
                              suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
             if (getenv("IK2_STATS")) print_window_timeline();
-            if (spec_on && getenv("IK2_STATS"))
+            if (spec_on && getenv("IK2_STATS")) {
                 std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
                              (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
                              (unsigned long long) sctl.drafted, (unsigned long long) sctl.plain);
+                // (the server's whole run so far, a mode a line: its header's tokens and marker, + an open fence)
+                for (size_t m = 0; mtrack.on() && m < mtrack.slot_toks.size(); ++m) {
+                    const SpecCtl::Mode& md = sctl.modes[m];
+                    if (!md.steps && !md.plain) continue;
+                    std::string name;
+                    for (int t : mtrack.slot_toks[m]) name += (name.empty() ? "" : " ") + std::to_string(t);
+                    std::fprintf(stderr,
+                                 "  mode %zu [%s%s]: %llu windows, %llu of %llu drafts accepted, %llu plain tokens, "
+                                 "%llu looks, the next after %d plain\n",
+                                 m, name.empty() ? "-" : name.c_str(), mtrack.slot_fence[m] ? " +fence" : "",
+                                 (unsigned long long) md.steps, (unsigned long long) md.accepted,
+                                 (unsigned long long) md.drafted, (unsigned long long) md.plain,
+                                 (unsigned long long) md.looks, md.probe_iv);
+                }
+            }
             if (meas_on) {
                 CU(cudaStreamSynchronize(g_s));
                 meas_print("STAT", meas0, meas_take(), meas_fw, (int) hist.size());

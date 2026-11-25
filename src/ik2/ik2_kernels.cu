@@ -1819,6 +1819,20 @@ __global__ void add_kernel(const float* a, const float* b, size_t n, float* y) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = a[i] + b[i];
 }
+// x * scale as FP8 (E4M3, saturating): the drafter's context K / V
+__global__ void to_e4m3_kernel(const float* x, size_t n, float scale, uint8_t* y) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = f32_to_e4m3fn(x[i] * scale);
+}
+// out2: the largest |x| and the mean of x * x (a measurement: one block)
+__global__ void abs_max_kernel(const float* x, size_t n, float* out2) {
+    __shared__ float sh[256];
+    float m = 0.0f, q = 0.0f;
+    for (size_t i = threadIdx.x; i < n; i += 256) m = fmaxf(m, fabsf(x[i])), q += x[i] * x[i];
+    m = bmax(m, sh);
+    q = bsum(q, sh);
+    if (threadIdx.x == 0) out2[0] = m, out2[1] = q / (float) n;
+}
 __global__ void to_f16_kernel(const float* x, size_t n, uint16_t* y) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = f2h(x[i]);
@@ -3966,75 +3980,90 @@ __global__ void rope_neox_kernel(float* x, int heads, const int* pos, float thet
     p[i + 64] = b * cs + a * sn;
 }
 
-// a block a (head, query): the logits a key a warp, softmax, the values
 // the drafter's attention, flash-decoding style: a block a (head, key chunk) for all the block's queries (nq <= 8) -
 // a key's K and V rows read once for them - its unnormalised output and (max, sum) a query, then merged.  Keys: the
-// context [k_lo, k_hi) (rows of a ring of cap: (k_lo + j) % cap) and the block's own nq (kb, vb).
-constexpr int kDraftQ = 8;
+// context [k_lo, k_hi) (rows of a ring of cap: (k_lo + j) % cap) and the block's own nq (kb, vb).  A chunk goes a
+// tile of kDraftTile keys at a time, its logits in shared memory and the sums so far rescaled to the tile's
+// maximum, so nothing here is as long as the context (the logits used to be: 1.5 KB a position).  An FP8 cache
+// (E4M3, written times a scale): kmul and vmul are 1 / the scales.
+constexpr int kDraftQ = 8, kDraftTile = 64;
 __device__ __forceinline__ float ld_f(const float* p) { return *p; }
 __device__ __forceinline__ float ld_f(const uint16_t* p) { return h2f(*p); }
+__device__ __forceinline__ float ld_f(const uint8_t* p) { return e4m3fn_to_f32(*p); }
 template <class KVT>
 __global__ void draft_attn_part_kernel(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi,
                                        const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int per,
-                                       float* lgs, float* part_o, float2* part_ml, int cap) {
-    __shared__ float sh[128];
+                                       float* part_o, float2* part_ml, int cap, float kmul, float vmul) {
     __shared__ float qs[kDraftQ][128];
-    __shared__ float mrow[kDraftQ];
-    const int h = blockIdx.x, sp = blockIdx.y, S = gridDim.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31,
-              warp = tid >> 5;
+    __shared__ float lg[kDraftQ][kDraftTile];
+    __shared__ float run_m[kDraftQ], run_l[kDraftQ], fac[kDraftQ];
+    const int h = blockIdx.x, sp = blockIdx.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int KD = Hkv * 128, nc = k_hi - k_lo, nk = nc + nq;
     const int j0 = min(nk, sp * per), j1 = min(nk, j0 + per), n = j1 - j0;
     for (int qi = 0; qi < nq; ++qi) qs[qi][tid] = q[((size_t) qi * H + h) * 128 + tid];
-    __syncthreads();
-    float* lg = lgs + ((size_t) h * S + sp) * kDraftQ * per;   // [nq][per]
-    float mx[kDraftQ];
-#pragma unroll
-    for (int qi = 0; qi < kDraftQ; ++qi) mx[qi] = -INFINITY;
-    for (int jj = warp; jj < n; jj += 4) {
-        const int j = j0 + jj;
-        float k0, k1, k2, k3;
-        if (j < nc) {
-            const KVT* kr = kc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128;
-            k0 = ld_f(kr + lane), k1 = ld_f(kr + lane + 32), k2 = ld_f(kr + lane + 64), k3 = ld_f(kr + lane + 96);
-        } else {
-            const float* kr = kb + (size_t) (j - nc) * KD + (size_t) g * 128;
-            k0 = kr[lane], k1 = kr[lane + 32], k2 = kr[lane + 64], k3 = kr[lane + 96];
-        }
-#pragma unroll
-        for (int qi = 0; qi < kDraftQ; ++qi) {
-            if (qi >= nq) break;
-            float a = qs[qi][lane] * k0 + qs[qi][lane + 32] * k1 + qs[qi][lane + 64] * k2 + qs[qi][lane + 96] * k3;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-            a *= scale;
-            if (lane == 0) lg[(size_t) qi * per + jj] = a;
-            mx[qi] = fmaxf(mx[qi], a);
-        }
-    }
-    __syncthreads();
-    for (int qi = 0; qi < nq; ++qi) {
-        const float m = bmax(mx[qi], sh);
-        float a = 0.0f;
-        for (int jj = tid; jj < n; jj += 128) {
-            const float e = m == -INFINITY ? 0.0f : expf(lg[(size_t) qi * per + jj] - m);
-            lg[(size_t) qi * per + jj] = e;
-            a += e;
-        }
-        const float l = bsum(a, sh);
-        if (tid == 0) mrow[qi] = m, part_ml[((size_t) sp * H + h) * kDraftQ + qi] = make_float2(m, l);
-    }
-    __syncthreads();
+    if (tid < kDraftQ) run_m[tid] = -INFINITY, run_l[tid] = 0.0f, fac[tid] = 0.0f;
     float o[kDraftQ];
 #pragma unroll
     for (int qi = 0; qi < kDraftQ; ++qi) o[qi] = 0.0f;
-    for (int jj = 0; jj < n; ++jj) {
-        const int j = j0 + jj;
-        const float v = j < nc ? ld_f(vc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128 + tid)
-                               : vb[(size_t) (j - nc) * KD + (size_t) g * 128 + tid];
+    __syncthreads();
+    for (int t0 = 0; t0 < n; t0 += kDraftTile) {
+        const int nt = min(kDraftTile, n - t0);
+        // the tile's logits: a key a warp
+        for (int jj = warp; jj < nt; jj += 4) {
+            const int j = j0 + t0 + jj;
+            float k0, k1, k2, k3;
+            if (j < nc) {
+                const KVT* kr = kc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128;
+                k0 = ld_f(kr + lane) * kmul, k1 = ld_f(kr + lane + 32) * kmul, k2 = ld_f(kr + lane + 64) * kmul,
+                k3 = ld_f(kr + lane + 96) * kmul;
+            } else {
+                const float* kr = kb + (size_t) (j - nc) * KD + (size_t) g * 128;
+                k0 = kr[lane], k1 = kr[lane + 32], k2 = kr[lane + 64], k3 = kr[lane + 96];
+            }
+#pragma unroll
+            for (int qi = 0; qi < kDraftQ; ++qi) {
+                if (qi >= nq) break;
+                float a = qs[qi][lane] * k0 + qs[qi][lane + 32] * k1 + qs[qi][lane + 64] * k2 + qs[qi][lane + 96] * k3;
+#pragma unroll
+                for (int o2 = 16; o2 > 0; o2 >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o2);
+                if (lane == 0) lg[qi][jj] = a * scale;
+            }
+        }
+        __syncthreads();
+        // a query a warp (two each): the tile's maximum, the factor that takes the sums so far to the new maximum,
+        // the tile's weights in the logits' place
+        for (int qi = warp; qi < nq; qi += 4) {
+            const float a0 = lane < nt ? lg[qi][lane] : -INFINITY, a1 = lane + 32 < nt ? lg[qi][lane + 32] : -INFINITY;
+            const float m_old = run_m[qi], l_old = run_l[qi];
+            float m = fmaxf(a0, a1);
+#pragma unroll
+            for (int o2 = 16; o2 > 0; o2 >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o2));
+            const float mx = fmaxf(m_old, m);
+            const float f = m_old == -INFINITY ? 0.0f : expf(m_old - mx);
+            const float e0 = lane < nt ? expf(a0 - mx) : 0.0f, e1 = lane + 32 < nt ? expf(a1 - mx) : 0.0f;
+            float sum = e0 + e1;
+#pragma unroll
+            for (int o2 = 16; o2 > 0; o2 >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o2);
+            if (lane < nt) lg[qi][lane] = e0;
+            if (lane + 32 < nt) lg[qi][lane + 32] = e1;
+            if (lane == 0) fac[qi] = f, run_m[qi] = mx, run_l[qi] = l_old * f + sum;
+        }
+        __syncthreads();
+        // the values: a thread a dimension
 #pragma unroll
         for (int qi = 0; qi < kDraftQ; ++qi)
-            if (qi < nq) o[qi] += lg[(size_t) qi * per + jj] * v;
+            if (qi < nq) o[qi] *= fac[qi];
+        for (int jj = 0; jj < nt; ++jj) {
+            const int j = j0 + t0 + jj;
+            const float v = j < nc ? ld_f(vc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128 + tid) * vmul
+                                   : vb[(size_t) (j - nc) * KD + (size_t) g * 128 + tid];
+#pragma unroll
+            for (int qi = 0; qi < kDraftQ; ++qi)
+                if (qi < nq) o[qi] += lg[qi][jj] * v;
+        }
+        __syncthreads();   // (the next tile's logits go where these weights are)
     }
+    if (tid < nq) part_ml[((size_t) sp * H + h) * kDraftQ + tid] = make_float2(run_m[tid], run_l[tid]);
     for (int qi = 0; qi < nq; ++qi) part_o[(((size_t) sp * H + h) * kDraftQ + qi) * 128 + tid] = o[qi];
 }
 __global__ void draft_attn_merge_kernel(const float* part_o, const float2* part_ml, int S, int H, float* out) {
@@ -5828,23 +5857,23 @@ void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaS
 template <class KVT>
 static void draft_attn_impl(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi, const float* kb,
                             const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
-                            cudaStream_t s, int cap) {
-    // scratch: the logits [H][S][8][per], the chunks' outputs [S][H][8][128] and (max, sum)
+                            cudaStream_t s, int cap, float kmul = 1.0f, float vmul = 1.0f) {
+    // scratch (draft_attn_scratch floats): the chunks' outputs [S][H][8][128] and (max, sum)
     if (nq > kDraftQ) {
         std::fprintf(stderr, "ik2::k::draft_attn: %d queries (at most %d)\n", nq, kDraftQ);
         std::abort();
     }
     const int nk = k_hi - k_lo + nq;
     const int S = std::max(1, std::min(64, (nk + 255) / 256)), per = (nk + S - 1) / S;
-    float* lgs = scratch;
-    float* part_o = lgs + (size_t) H * S * kDraftQ * per;
+    float* part_o = scratch;
     float2* part_ml = (float2*) (part_o + (size_t) S * H * kDraftQ * 128);
     draft_attn_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
-        q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, per, lgs, part_o, part_ml, cap > 0 ? cap : (1 << 30));
+        q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, per, part_o, part_ml, cap > 0 ? cap : (1 << 30), kmul, vmul);
     check("draft_attn (chunks)");
     draft_attn_merge_kernel<<<dim3((unsigned) H, (unsigned) nq), 128, 0, s>>>(part_o, part_ml, S, H, out);
     check("draft_attn (merge)");
 }
+size_t draft_attn_scratch(int H) { return (size_t) 64 * H * kDraftQ * 130; }
 void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int k_hi, const float* kb, const float* vb,
                 int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s, int cap) {
     draft_attn_impl<float>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
@@ -5853,6 +5882,21 @@ void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int 
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
                     int cap) {
     draft_attn_impl<uint16_t>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
+}
+void draft_attn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                    int cap, float k_scale, float v_scale) {
+    draft_attn_impl<uint8_t>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap, 1.0f / k_scale,
+                             1.0f / v_scale);
+}
+void to_e4m3(const float* x, size_t n, float scale, uint8_t* y, cudaStream_t s) {
+    if (!n) return;
+    to_e4m3_kernel<<<grid(n), kBlk, 0, s>>>(x, n, scale, y);
+    check("to_e4m3");
+}
+void abs_max(const float* x, size_t n, float* out2, cudaStream_t s) {
+    abs_max_kernel<<<1, 256, 0, s>>>(x, n, out2);
+    check("abs_max");
 }
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s) {
     silu_mul_bf16_kernel<<<grid((size_t) T * F), kBlk, 0, s>>>(gu, T, F, out);

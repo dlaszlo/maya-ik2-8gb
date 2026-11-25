@@ -5635,7 +5635,9 @@ int main(int argc, char** argv) {
                 std::fclose(df);
             }
             const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : 0;
-            const size_t per = (size_t) c.KV * c.D * 2 * 2;   // (a position of the global layer: K and V in FP16)
+            // (a position of the global layer: K and V in FP16, or FP8 with IK2_DRAFT_KV=fp8)
+            const bool d8 = getenv("IK2_DRAFT_KV") && std::string(getenv("IK2_DRAFT_KV")) == "fp8";
+            const size_t per = (size_t) c.KV * c.D * 2 * (d8 ? 1 : 2);
             if (want > 0) draft_b += (size_t) std::min(ctx, std::max(want, 2048)) * per;
             else draft_tok = per;                             // (the whole context: grows with it)
             draft_b += (size_t) 2 * std::min(ctx, 2048) * c.KV * c.D * 8 + ((size_t) 256 << 20);
@@ -6416,6 +6418,15 @@ int main(int argc, char** argv) {
             arrs.push_back(g_kv_fp8 ? Vi.kc8 : (uint8_t*) Vi.kc);
             arrs.push_back(g_kv_fp8 ? Vi.vc8 : (uint8_t*) Vi.vc);
             arr_bytes = (size_t) Vi.kv_cap * row_bytes;
+        }
+        // (the drafter's own K / V when they are the same arrays - FP8, a row a position, the whole context:
+        //  IK2_DRAFT_KV=fp8 - fill from the front with the same positions, so their ends are lent too)
+        if (drafter && !arrs.empty()) {
+            uint8_t *dk = nullptr, *dv = nullptr;
+            size_t d_rows = 0, d_row = 0;
+            if (ik2::draft::kv_arrays(drafter, &dk, &dv, &d_rows, &d_row) && d_row == row_bytes &&
+                d_rows * d_row == arr_bytes)
+                arrs.push_back(dk), arrs.push_back(dv);
         }
         int p = -1;   // (the pool of the most layers: the others' slots are larger)
         for (size_t i = 0; i < EC.pools.size(); ++i)

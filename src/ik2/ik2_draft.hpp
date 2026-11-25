@@ -49,6 +49,10 @@ void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
 void set_head_nvfp4(Drafter* d, const uint8_t* blocks, float scale);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
+/// The whole-context layer's K and V arrays when they are FP8 and hold every position (IK2_DRAFT_KV=fp8, no shorter
+/// IK2_DRAFT_CTX): [rows][row_bytes], position p at row p - the layout of the target's FP8 arrays, so IK2_KV_LEND can
+/// lend their unused ends too.  false: nothing to lend.
+bool kv_arrays(const Drafter* d, uint8_t** k, uint8_t** v, size_t* rows, size_t* row_bytes);
 /// A conversation of P positions kept in host RAM and brought back (the serve loop's IK2_SLOT_KEEP): the bytes of its
 /// context caches (each layer's slots 0 .. min(P, cap) - 1, and f_rnn), and their copy out to / back from `host`.
 size_t context_bytes(const Drafter* d, int P);

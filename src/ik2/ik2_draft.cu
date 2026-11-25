@@ -137,13 +137,25 @@ struct DLayer {
     uint16_t *wq, *wk, *wv, *wo, *wkc, *wvc, *wgu, *wd;   // BF16 [out][in]
     float *kc = nullptr, *vc = nullptr;                    // the context caches, F32 [cap][KV * 128] (a window's
     uint16_t *kc16 = nullptr, *vc16 = nullptr;             //  layer) or FP16 (the layer that sees the whole context)
+    uint8_t *kc8 = nullptr, *vc8 = nullptr;                //  or that layer's as FP8 (IK2_DRAFT_KV=fp8)
     int cap = 0;                                           // their rows: a ring of the last cap positions
 };
 
 struct Drafter {
     int taps = 8, C = 4608, H = 48, KV = 8, F = 18432, R = 256, V = 0, ctx = 0;
     int cap = 0;   // the rows of the layer without a window's context cache (IK2_DRAFT_CTX, default the context)
-    float* ctx_tmp = nullptr;   // write_context's K and V rows before an FP16 cache, [2][kMixRows][KV * 128]
+    float* ctx_tmp = nullptr;   // write_context's K and V rows before an FP16 / FP8 cache, [2][kMixRows][KV * 128]
+    // IK2_DRAFT_KV=fp8: the whole-context layer's K / V as FP8 (E4M3) times these scales - a byte a value, as the
+    // target's FP8 cache, so the two arrays are the size of the target's and their unused ends can be lent to the
+    // expert cache with them (kv_arrays, IK2_KV_LEND).  The drafts get a little noise; the target checks them all.
+    bool kv_fp8 = false;
+    // (measured on the Mini, IK2_DRAFT_KV_CHECK: K up to 14.6 with an rms of 1.7, V up to 13.7 with 2.1 - E4M3 times
+    //  16 holds 28 and still resolves 1e-4; IK2_DRAFT_KV_SCALE=k,v)
+    float k_scale = 16.0f, v_scale = 16.0f;
+    // IK2_DRAFT_KV_CHECK=1 (a measurement): the largest |K|, |V| written and their mean squares, printed as they grow
+    bool kv_check = false;
+    float kv_seen[2] = {0, 0};
+    float* kv_stat = nullptr;
     float eps = 1e-6f, theta = 1e6f;
     std::vector<DLayer> L;
     float *alpha, *norm, *mask, *mk_dflare, *rnn_b;
@@ -277,7 +289,10 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     // Local layers (0, 1, 3, 4) match SGLang inkling2_mtp.py's window_anchor_at_start=True with window=1024:
     // every query in the block [P .. P+7] sees context [max(0, P - 1023) .. P-1] plus all 8 block tokens.
     const int k_lo = l.local ? std::max(0, P - 1023) : std::max(0, P - l.cap);
-    if (l.kc16)
+    if (l.kc8)
+        k::draft_attn_fp8(d->q, l.kc8, l.vc8, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
+                          d->scratch, d->o, d->s, l.cap, d->k_scale, d->v_scale);
+    else if (l.kc16)
         k::draft_attn_f16(d->q, l.kc16, l.vc16, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
                           d->scratch, d->o, d->s, l.cap);
     else
@@ -310,6 +325,13 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default the whole context)
         const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : ctx;
         d->cap = std::min(ctx, std::max(want, 2048));
+        const char* kv = getenv("IK2_DRAFT_KV");
+        d->kv_fp8 = kv && std::string(kv) == "fp8";
+        if (const char* sc = getenv("IK2_DRAFT_KV_SCALE")) {
+            float a = 0, b = 0;
+            if (std::sscanf(sc, "%f,%f", &a, &b) == 2 && a > 0 && b > 0) d->k_scale = a, d->v_scale = b;
+        }
+        d->kv_check = getenv("IK2_DRAFT_KV_CHECK") && std::atoi(getenv("IK2_DRAFT_KV_CHECK"));
     }
     const bool mini = C == 2304;
     if (mini) {
@@ -369,7 +391,12 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
             l.kc = dalloc<float>((size_t) l.cap * KV * 128);
             l.vc = dalloc<float>((size_t) l.cap * KV * 128);
             d->vram += (size_t) l.cap * KV * 128 * 8;
-        } else {         // (the whole context, or IK2_DRAFT_CTX's last positions: FP16)
+        } else if (d->kv_fp8) {   // (the whole context, or IK2_DRAFT_CTX's last positions: FP8)
+            l.cap = d->cap;
+            l.kc8 = dalloc<uint8_t>((size_t) l.cap * KV * 128);
+            l.vc8 = dalloc<uint8_t>((size_t) l.cap * KV * 128);
+            d->vram += (size_t) l.cap * KV * 128 * 2;
+        } else {         // (... FP16)
             l.cap = d->cap;
             l.kc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
             l.vc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
@@ -392,9 +419,10 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->gu = dalloc<float>(T * 2 * F);
     d->hb = dalloc<uint16_t>(std::max<size_t>(T * std::max<int64_t>(C, H * 128), (size_t) kMixRows * C));
     d->hb2 = dalloc<uint16_t>(T * F);
-    // (draft_attn's: the logits [H][8][<= cap + T + chunk padding], the chunks' outputs [64][H][8][128], (max, sum))
+    // (draft_attn's: the chunks' outputs [64][H][8][128] and (max, sum) - not a function of the context)
     d->ctx_tmp = dalloc<float>((size_t) 2 * kMixRows * KV * 128);
-    d->scratch = dalloc<float>((size_t) H * 8 * (d->cap + T + 512) + (size_t) 64 * H * 8 * 130);
+    d->scratch = dalloc<float>(k::draft_attn_scratch(H));
+    d->kv_stat = dalloc<float>(2);
     d->mix = dalloc<float>((size_t) kMixRows * C);
     d->f_rnn = dalloc<float>(C);
     d->state = dalloc<float>(R), d->latent = dalloc<float>(R), d->proj = dalloc<float>(3 * R);
@@ -460,8 +488,9 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
             k::mix_rms(taps + (size_t) (r0 + a) * C, d->taps, (size_t) ld * C, n, C, d->alpha + li * d->taps, l.dflare,
                        d->eps, d->mix, d->s);
             k::to_bf16(d->mix, (size_t) n * C, d->hb, d->s);
-            float* kd = l.kc16 ? d->ctx_tmp : l.kc + (size_t) at * KD;
-            float* vd = l.kc16 ? d->ctx_tmp + (size_t) kMixRows * KD : l.vc + (size_t) at * KD;
+            const bool packed = l.kc16 || l.kc8;
+            float* kd = packed ? d->ctx_tmp : l.kc + (size_t) at * KD;
+            float* vd = packed ? d->ctx_tmp + (size_t) kMixRows * KD : l.vc + (size_t) at * KD;
             gemm_bf(d, l.wkc, KD, C, d->hb, n, kd, KD);
             gemm_bf(d, l.wvc, KD, C, d->hb, n, vd, KD);
             k::rms(kd, l.k_norm_ctx, n * d->KV, 128, d->eps, kd, d->s);
@@ -469,6 +498,23 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
             if (l.kc16) {
                 k::to_f16(kd, (size_t) n * KD, l.kc16 + (size_t) at * KD, d->s);
                 k::to_f16(vd, (size_t) n * KD, l.vc16 + (size_t) at * KD, d->s);
+            } else if (l.kc8) {
+                k::to_e4m3(kd, (size_t) n * KD, d->k_scale, l.kc8 + (size_t) at * KD, d->s);
+                k::to_e4m3(vd, (size_t) n * KD, d->v_scale, l.vc8 + (size_t) at * KD, d->s);
+            }
+            if (d->kv_check && !l.local) {   // (what an FP8 cache would have to hold: 448 / scale is its largest)
+                float st[2];
+                for (int w = 0; w < 2; ++w) {
+                    k::abs_max(w ? vd : kd, (size_t) n * KD, d->kv_stat, d->s);
+                    cu(cudaStreamSynchronize(d->s), "kv check");
+                    cu(cudaMemcpy(st, d->kv_stat, sizeof st, cudaMemcpyDeviceToHost), "kv check");
+                    if (st[0] > d->kv_seen[w] * 1.05f) {
+                        d->kv_seen[w] = st[0];
+                        std::fprintf(stderr, "drafter %s at position %d: largest |x| %.3f, rms %.4f (FP8 holds %.1f)\n",
+                                     w ? "V" : "K", pos0 + a, st[0], std::sqrt(st[1]),
+                                     448.0f / (w ? d->v_scale : d->k_scale));
+                    }
+                }
             }
             a += n;
         }
@@ -539,12 +585,21 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 
 size_t bytes(const Drafter* d) { return d->vram; }
 
+bool kv_arrays(const Drafter* d, uint8_t** k, uint8_t** v, size_t* rows, size_t* row_bytes) {
+    for (const auto& l : d->L)
+        if (l.kc8 && l.cap == d->ctx) {   // (a ring shorter than the context wraps: its end is never free)
+            *k = l.kc8, *v = l.vc8, *rows = (size_t) l.cap, *row_bytes = (size_t) d->KV * 128;
+            return true;
+        }
+    return false;
+}
+
 // A conversation parked in host RAM (the serve loop's IK2_SLOT_KEEP): each layer's context cache, slots 0 .. min(P, cap)
 // - 1 (the positions themselves before a ring wraps, the whole ring after), K then V, and f_rnn last.
 size_t context_bytes(const Drafter* d, int P) {
     const size_t KD = (size_t) d->KV * 128;
     size_t b = (size_t) d->C * 4;
-    for (const auto& l : d->L) b += 2 * (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
+    for (const auto& l : d->L) b += 2 * (size_t) std::min(P, l.cap) * KD * (l.kc8 ? 1 : l.kc16 ? 2 : 4);
     return b;
 }
 static void copy_context(Drafter* d, int P, uint8_t* host, bool save) {
@@ -557,9 +612,9 @@ static void copy_context(Drafter* d, int P, uint8_t* host, bool save) {
         at += n;
     };
     for (auto& l : d->L) {
-        const size_t n = (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
-        one(l.kc16 ? (void*) l.kc16 : (void*) l.kc, n);
-        one(l.kc16 ? (void*) l.vc16 : (void*) l.vc, n);
+        const size_t n = (size_t) std::min(P, l.cap) * KD * (l.kc8 ? 1 : l.kc16 ? 2 : 4);
+        one(l.kc8 ? (void*) l.kc8 : l.kc16 ? (void*) l.kc16 : (void*) l.kc, n);
+        one(l.kc8 ? (void*) l.vc8 : l.kc16 ? (void*) l.vc16 : (void*) l.vc, n);
     }
     one(d->f_rnn, (size_t) d->C * 4);
 }

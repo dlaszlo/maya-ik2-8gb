@@ -93,39 +93,6 @@ inline float hsum256(__m256 v) {
     return _mm_cvtss_f32(_mm_add_ss(t, _mm_shuffle_ps(t, t, 1)));
 }
 
-// The same blocks as nvfp4_rows_avx512, eight lanes at a time: a 16-value sub-block is two __m256 halves
-// (values 0..7 the low nibbles, 8..15 the high nibbles of its 8 bytes), four accumulators for the FMA latency.
-__attribute__((target("avx2,fma")))
-void nvfp4_rows_avx2(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
-    const __m128i tab = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
-    const __m128i m4 = _mm_set1_epi8(0x0F);
-    const int nb = K / 64;
-    const size_t rb = (size_t) nb * 36;
-    for (int r = r0; r < r1; ++r) {
-        const uint8_t* b = W + (size_t) r * rb;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-        const float* xp = x;
-        for (int i = 0; i < nb; ++i, b += 36, xp += 64) {
-#define IK2_SUB2(sb, accl, acch)                                                                   \
-    {                                                                                              \
-        const __m128i raw = _mm_loadl_epi64((const __m128i*) (b + 4 + (sb) * 8));                 \
-        const __m128i lo = _mm_and_si128(raw, m4);                                                 \
-        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);                              \
-        const __m256 vl = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_shuffle_epi8(tab, lo)));    \
-        const __m256 vh = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_shuffle_epi8(tab, hi)));    \
-        const __m256 s = _mm256_set1_ps(g_scale.v[b[sb]]);                                         \
-        accl = _mm256_fmadd_ps(vl, _mm256_mul_ps(_mm256_loadu_ps(xp + (sb) * 16), s), accl);      \
-        acch = _mm256_fmadd_ps(vh, _mm256_mul_ps(_mm256_loadu_ps(xp + (sb) * 16 + 8), s), acch);  \
-    }
-            IK2_SUB2(0, a0, a1)
-            IK2_SUB2(1, a2, a3)
-            IK2_SUB2(2, a0, a1)
-            IK2_SUB2(3, a2, a3)
-#undef IK2_SUB2
-        }
-        out[r - r0] = hsum256(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
-    }
-}
 #endif
 
 void nvfp4_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
@@ -170,30 +137,292 @@ void q8_0_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, f
     }
 }
 
-__attribute__((target("avx2,fma,f16c")))
-void q8_0_rows_avx2(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
-    const int nb = K / 32;
-    const size_t rb = (size_t) nb * 34;
-    for (int r = r0; r < r1; ++r) {
-        const uint8_t* b = W + (size_t) r * rb;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-        const float* xp = x;
-        for (int i = 0; i < nb; ++i, b += 34, xp += 32) {
-            uint16_t h;
-            std::memcpy(&h, b, 2);
-            const __m256 d = _mm256_set1_ps(_cvtsh_ss(h));
-            const __m128i q0 = _mm_loadu_si128((const __m128i*) (b + 2));
-            const __m128i q1 = _mm_loadu_si128((const __m128i*) (b + 18));
-            const __m256 v0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q0));
-            const __m256 v1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8)));
-            const __m256 v2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1));
-            const __m256 v3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8)));
-            a0 = _mm256_fmadd_ps(v0, _mm256_mul_ps(_mm256_loadu_ps(xp), d), a0);
-            a1 = _mm256_fmadd_ps(v1, _mm256_mul_ps(_mm256_loadu_ps(xp + 8), d), a1);
-            a2 = _mm256_fmadd_ps(v2, _mm256_mul_ps(_mm256_loadu_ps(xp + 16), d), a2);
-            a3 = _mm256_fmadd_ps(v3, _mm256_mul_ps(_mm256_loadu_ps(xp + 24), d), a3);
+// ---- The AVX2 kernels ----
+// A row's weights are decoded to F32 - exactly: an NVFP4 value times its sub-block's scale has 8 significant bits
+// at most, a Q8_0 value times its block's FP16 scale 19 - and a product is one FMA.  Per input and row, with two
+// accumulators of 8 lanes (the 8-value groups of the row alternate between them):
+//     acc[(k >> 3) & 1][k & 7] = fma(w[k], x[k], acc[(k >> 3) & 1][k & 7])   for k = 0 .. K - 1 in this order,
+//     the row = hsum256(acc[0] + acc[1]).
+// Every kernel below - any number of inputs, one or several rows a pass, the weights decoded in registers or
+// through a buffer, the accumulators in registers all along or parked in memory between two column steps - does
+// exactly these operations in this order for an (input, row): they agree bit for bit.
+// (The scale is no longer multiplied into the input, as the AVX-512 kernels above still do: one multiplication
+//  a decoded value for all the inputs, instead of one an input.  The sums differ from those kernels' by a
+//  rounding of every product.)
+#define IK2_AVX2 __attribute__((target("avx2,fma,f16c")))
+#define IK2_AVX2_INLINE __attribute__((target("avx2,fma,f16c"), always_inline)) inline
+
+// 8 int8 values times a scale, as F32
+IK2_AVX2_INLINE __m256 i8x8_ps(const uint8_t* p, __m256 s) {
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*) p))), s);
+}
+
+// A format: its blocks of kBlock values in kBytes bytes; open() a block, then pair() its 16-value groups in order
+// (wl the values 0 .. 7 of the group, wh 8 .. 15).  kRows1 / kRows2: the rows a pass of one input / of two (below).
+struct Nvfp4 {
+    static constexpr int kBlock = 64, kBytes = 36, kRows1 = 4, kRows2 = 2;
+    // the block's 64 values as int8: t[sb * 8 + j] value j < 8 of sub-block sb, t[32 + sb * 8 + j] value 8 + j
+    struct Blk {
+        alignas(32) uint8_t t[64];
+    };
+    static IK2_AVX2_INLINE void open(const uint8_t* b, Blk& s) {
+        const __m256i tab = _mm256_broadcastsi128_si256(
+            _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12));
+        const __m256i m4 = _mm256_set1_epi8(0x0F);
+        const __m256i raw = _mm256_loadu_si256((const __m256i*) (b + 4));
+        _mm256_store_si256((__m256i*) s.t, _mm256_shuffle_epi8(tab, _mm256_and_si256(raw, m4)));
+        _mm256_store_si256((__m256i*) (s.t + 32),
+                           _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(raw, 4), m4)));
+        // (t really in memory: the eight VPMOVSXBD below then read it with their load - the store forwards -
+        //  instead of the compiler's shuffles of the two registers, which crowd the ports the FMAs need.
+        //  Measured: one input 21% faster.)
+        __asm__ volatile("" : : "r"(s.t) : "memory");
+    }
+    static IK2_AVX2_INLINE void pair(const Blk& s, const uint8_t* b, int g, __m256& wl, __m256& wh) {
+        const __m256 sc = _mm256_broadcast_ss(&g_scale.v[b[g]]);
+        wl = i8x8_ps(s.t + g * 8, sc);
+        wh = i8x8_ps(s.t + 32 + g * 8, sc);
+    }
+};
+struct Q8 {
+    static constexpr int kBlock = 32, kBytes = 34, kRows1 = 1, kRows2 = 1;
+    struct Blk {
+        __m256 d;
+    };
+    static IK2_AVX2_INLINE void open(const uint8_t* b, Blk& s) {
+        uint16_t h;
+        std::memcpy(&h, b, 2);
+        s.d = _mm256_set1_ps(_cvtsh_ss(h));
+    }
+    static IK2_AVX2_INLINE void pair(const Blk& s, const uint8_t* b, int g, __m256& wl, __m256& wh) {
+        wl = i8x8_ps(b + 2 + g * 16, s.d);
+        wh = i8x8_ps(b + 10 + g * 16, s.d);
+    }
+};
+
+// ---- Up to four inputs: the weights decoded in registers ----
+// R consecutive rows (the first at b0, rb bytes a row, nb blocks) against N inputs: outs[q][j] = row j . xs[q].
+// N * R * 2 FMA chains - 8 fill the two FMA ports, so one input or two would take 4 or 2 rows a pass.  They do
+// for NVFP4 (one input 0.76 instead of 0.98 ns a 16 values with the expert in cache, and no slower from memory);
+// Q8_0's rows are 2448 bytes, and several of them read side by side come slower from memory than one after
+// the other (measured, 6 workers, us an expert: one input 191 / 199 / 206 with 1 / 2 / 4 rows a pass, two inputs
+// 198 / 206 with 1 / 2) - one row.
+template <class Fmt, int N, int R>
+IK2_AVX2_INLINE void rows_core(const uint8_t* b0, size_t rb, int nb, const float* const* xs, float* const* outs) {
+    const float* x[N];
+    const uint8_t* b[R];
+    __m256 lo[R][N], hi[R][N];
+    for (int q = 0; q < N; ++q) x[q] = xs[q];
+    for (int j = 0; j < R; ++j) {
+        b[j] = b0 + (size_t) j * rb;
+        for (int q = 0; q < N; ++q) lo[j][q] = hi[j][q] = _mm256_setzero_ps();
+    }
+    size_t k = 0;
+    for (int i = 0; i < nb; ++i) {
+        typename Fmt::Blk blk[R];
+        for (int j = 0; j < R; ++j) Fmt::open(b[j], blk[j]);
+        for (int g = 0; g < Fmt::kBlock / 16; ++g, k += 16)
+            for (int j = 0; j < R; ++j) {
+                __m256 wl, wh;
+                Fmt::pair(blk[j], b[j], g, wl, wh);
+                for (int q = 0; q < N; ++q) {
+                    lo[j][q] = _mm256_fmadd_ps(wl, _mm256_loadu_ps(x[q] + k), lo[j][q]);
+                    hi[j][q] = _mm256_fmadd_ps(wh, _mm256_loadu_ps(x[q] + k + 8), hi[j][q]);
+                }
+            }
+        for (int j = 0; j < R; ++j) b[j] += Fmt::kBytes;
+    }
+    for (int j = 0; j < R; ++j)
+        for (int q = 0; q < N; ++q) outs[q][j] = hsum256(_mm256_add_ps(lo[j][q], hi[j][q]));
+}
+
+// outs[q][r - r0] = W[r] . xs[q] for rows r0 .. r1 - 1 and N inputs, R rows a pass (then the rows left one a pass)
+template <class Fmt, int N, int R>
+IK2_AVX2 void rows_avx2(const uint8_t* W, int K, int r0, int r1, const float* const* xs, float* const* outs) {
+    const int nb = K / Fmt::kBlock;
+    const size_t rb = (size_t) nb * Fmt::kBytes;
+    float* o[N];
+    int r = r0;
+    for (; r + R <= r1; r += R) {
+        for (int q = 0; q < N; ++q) o[q] = outs[q] + (r - r0);
+        rows_core<Fmt, N, R>(W + (size_t) r * rb, rb, nb, xs, o);
+    }
+    for (; r < r1; ++r) {
+        for (int q = 0; q < N; ++q) o[q] = outs[q] + (r - r0);
+        rows_core<Fmt, N, 1>(W + (size_t) r * rb, rb, nb, xs, o);
+    }
+}
+
+// ---- More than four inputs: blocked for L1 ----
+// kRun rows, kCols columns a step: that piece of the rows decoded once into w (kRun x kCols F32), then the inputs
+// four a pass over it - the decoding is shared by all the inputs.  The accumulators of every (row, input) wait in
+// acc between two column steps: the FMAs of an (input, row) are rows_core's, in its order.  w, acc and the
+// columns of a pass's four inputs stay in L1 (16 + 16 + 4 KB at 16 inputs).
+constexpr int kRun = 16, kCols = 256;   // (kCols: whole blocks of either format)
+
+// kn columns from k0 of R decoded rows (w0, ws values apart) against N inputs; the accumulators of row j and
+// input q at acc + j * as + q * 16 (lo, then hi)
+template <int N, int R>
+IK2_AVX2_INLINE void dot_chunk(const float* w0, size_t ws, int kn, const float* const* xs, size_t k0, float* acc,
+                               size_t as) {
+    const float* x[N];
+    __m256 lo[R][N], hi[R][N];
+    for (int q = 0; q < N; ++q) x[q] = xs[q] + k0;
+    for (int j = 0; j < R; ++j)
+        for (int q = 0; q < N; ++q) {
+            lo[j][q] = _mm256_load_ps(acc + j * as + q * 16);
+            hi[j][q] = _mm256_load_ps(acc + j * as + q * 16 + 8);
         }
-        out[r - r0] = hsum256(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+#define IK2_DOT_STEP(k)                                                                       \
+    for (int j = 0; j < R; ++j) {                                                            \
+        const __m256 wl = _mm256_load_ps(w0 + j * ws + (k));                                 \
+        const __m256 wh = _mm256_load_ps(w0 + j * ws + (k) + 8);                             \
+        for (int q = 0; q < N; ++q) {                                                        \
+            lo[j][q] = _mm256_fmadd_ps(wl, _mm256_loadu_ps(x[q] + (k)), lo[j][q]);           \
+            hi[j][q] = _mm256_fmadd_ps(wh, _mm256_loadu_ps(x[q] + (k) + 8), hi[j][q]);       \
+        }                                                                                    \
+    }
+    // (64 values a turn: the addresses are a register and a constant, an FMA and its load stay one micro-op)
+    int k = 0;
+    for (; k + 64 <= kn; k += 64) {
+        IK2_DOT_STEP(k)
+        IK2_DOT_STEP(k + 16)
+        IK2_DOT_STEP(k + 32)
+        IK2_DOT_STEP(k + 48)
+    }
+    for (; k < kn; k += 16) IK2_DOT_STEP(k)
+#undef IK2_DOT_STEP
+    for (int j = 0; j < R; ++j)
+        for (int q = 0; q < N; ++q) {
+            _mm256_store_ps(acc + j * as + q * 16, lo[j][q]);
+            _mm256_store_ps(acc + j * as + q * 16 + 8, hi[j][q]);
+        }
+}
+// (R rows a pass, then the rows left one a pass)
+template <int N, int R>
+IK2_AVX2_INLINE void dot_chunks(const float* w, int nr, int kn, const float* const* xs, size_t k0, float* acc,
+                                size_t as) {
+    int j = 0;
+    for (; j + R <= nr; j += R) dot_chunk<N, R>(w + (size_t) j * kn, kn, kn, xs, k0, acc + j * as, as);
+    for (; j < nr; ++j) dot_chunk<N, 1>(w + (size_t) j * kn, kn, kn, xs, k0, acc + j * as, as);
+}
+
+template <class Fmt>
+IK2_AVX2 void rows_blocked_avx2(const uint8_t* W, int K, int r0, int r1, int n, const float* const* xs,
+                                float* const* outs) {
+    alignas(64) float w[kRun * kCols];
+    alignas(64) float acc[kRun * ExpertJob::kMaxIn * 16];
+    const size_t rb = (size_t) (K / Fmt::kBlock) * Fmt::kBytes, as = (size_t) n * 16;
+    for (int ra = r0; ra < r1; ra += kRun) {
+        const int nr = std::min(kRun, r1 - ra);
+        std::memset(acc, 0, (size_t) nr * as * sizeof(float));
+        for (int k0 = 0; k0 < K; k0 += kCols) {
+            const int kn = std::min(kCols, K - k0);
+            // (the next step's pieces of the rows - short and a row apart - are asked for now and come from memory
+            //  while this step is computed.  Measured: Q8_0 with 5 .. 8 inputs 3 - 4% faster, the rest the same.)
+            {
+                int kk = k0 + kCols, rr = ra;
+                if (kk >= K) kk = 0, rr = ra + kRun;
+                const size_t off = (size_t) (kk / Fmt::kBlock) * Fmt::kBytes;
+                const size_t len = (size_t) (std::min(kCols, K - kk) / Fmt::kBlock) * Fmt::kBytes;
+                for (int r = rr; r < std::min(r1, rr + kRun); ++r) {
+                    const char* const p = (const char*) W + (size_t) r * rb + off;
+                    for (size_t o = 0; o < len; o += 64) _mm_prefetch(p + o, _MM_HINT_T0);
+                    _mm_prefetch(p + len - 1, _MM_HINT_T0);
+                }
+            }
+            float* wp = w;
+            for (int j = 0; j < nr; ++j) {
+                const uint8_t* b = W + (size_t) (ra + j) * rb + (size_t) (k0 / Fmt::kBlock) * Fmt::kBytes;
+                for (int i = 0; i < kn / Fmt::kBlock; ++i, b += Fmt::kBytes) {
+                    typename Fmt::Blk blk;
+                    Fmt::open(b, blk);
+                    for (int g = 0; g < Fmt::kBlock / 16; ++g, wp += 16) {
+                        __m256 wl, wh;
+                        Fmt::pair(blk, b, g, wl, wh);
+                        _mm256_store_ps(wp, wl);
+                        _mm256_store_ps(wp + 8, wh);
+                    }
+                }
+            }
+            // (the inputs left after the fours: with 2 or 4 rows a pass, for the 8 chains)
+            for (int q = 0; q < n; q += 4) switch (std::min(4, n - q)) {
+                case 1: dot_chunks<1, 4>(w, nr, kn, xs + q, k0, acc + q * 16, as); break;
+                case 2: dot_chunks<2, 2>(w, nr, kn, xs + q, k0, acc + q * 16, as); break;
+                case 3: dot_chunks<3, 1>(w, nr, kn, xs + q, k0, acc + q * 16, as); break;
+                default: dot_chunks<4, 1>(w, nr, kn, xs + q, k0, acc + q * 16, as); break;
+                }
+        }
+        for (int j = 0; j < nr; ++j)
+            for (int q = 0; q < n; ++q)
+                outs[q][ra - r0 + j] = hsum256(_mm256_add_ps(_mm256_load_ps(acc + j * as + q * 16),
+                                                             _mm256_load_ps(acc + j * as + q * 16 + 8)));
+    }
+}
+
+// Rows r0 .. r1 - 1 against n inputs
+template <class Fmt>
+IK2_AVX2 void rows_n_avx2(const uint8_t* W, int K, int r0, int r1, int n, const float* const* xs,
+                          float* const* outs) {
+    switch (n) {
+    case 1: rows_avx2<Fmt, 1, Fmt::kRows1>(W, K, r0, r1, xs, outs); return;
+    case 2: rows_avx2<Fmt, 2, Fmt::kRows2>(W, K, r0, r1, xs, outs); return;
+    case 3: rows_avx2<Fmt, 3, 1>(W, K, r0, r1, xs, outs); return;
+    case 4: rows_avx2<Fmt, 4, 1>(W, K, r0, r1, xs, outs); return;
+    }
+    rows_blocked_avx2<Fmt>(W, K, r0, r1, n, xs, outs);
+}
+
+// ---- The activation, 8 rows a step ----
+// e^x - 1 for x in [-87, 87]: x = n ln 2 + r, |r| <= ln 2 / 2; e^r - 1 = r + r^2 P(r) (Cephes' expf polynomial);
+// 2^n (e^r - 1) + (2^n - 1) - no cancellation at small x (n = 0: the polynomial itself).
+IK2_AVX2_INLINE __m256 expm1_avx2(__m256 x) {
+    const __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)),
+                                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693359375f), x);
+    r = _mm256_fnmadd_ps(n, _mm256_set1_ps(-2.12194440e-4f), r);
+    __m256 p = _mm256_set1_ps(1.9875691500e-4f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.3981999507e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519073e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665795894e-2f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665459e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.0000001201e-1f));
+    const __m256 q = _mm256_fmadd_ps(_mm256_mul_ps(r, r), p, r);
+    const __m256 two_n = _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23));
+    return _mm256_fmadd_ps(two_n, q, _mm256_sub_ps(two_n, _mm256_set1_ps(1.0f)));
+}
+// tanh z = sign(z) m / (m + 2), m = e^(2 |z|) - 1
+IK2_AVX2_INLINE __m256 tanh_avx2(__m256 z) {
+    const __m256 sign = _mm256_and_ps(z, _mm256_set1_ps(-0.0f));
+    const __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), z);
+    const __m256 m = expm1_avx2(_mm256_min_ps(_mm256_set1_ps(87.0f), _mm256_add_ps(a, a)));   // (a NaN stays one)
+    return _mm256_or_ps(_mm256_div_ps(m, _mm256_add_ps(m, _mm256_set1_ps(2.0f))), sign);
+}
+// h = gcap tanh(gs / gcap) sigmoid(gs) ucap tanh(us / ucap), gs = g sg, us = u su;  sigmoid(gs) = 1 / (2 + (e^-gs - 1))
+IK2_AVX2_INLINE __m256 act_avx2(__m256 g, __m256 u, __m256 sg, __m256 su, __m256 gcap, __m256 ucap) {
+    const __m256 gs = _mm256_mul_ps(g, sg), us = _mm256_mul_ps(u, su);
+    const __m256 tg = tanh_avx2(_mm256_div_ps(gs, gcap)), tu = tanh_avx2(_mm256_div_ps(us, ucap));
+    const __m256 ng = _mm256_min_ps(
+        _mm256_set1_ps(87.0f), _mm256_max_ps(_mm256_set1_ps(-87.0f), _mm256_xor_ps(gs, _mm256_set1_ps(-0.0f))));
+    const __m256 sig = _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(_mm256_set1_ps(2.0f), expm1_avx2(ng)));
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(gcap, tg), sig), ucap), tu);
+}
+// (the one function of every job, whatever its inputs: a row's value does not depend on the rows around it -
+//  the rows past a multiple of 8 go through the same lanes)
+IK2_AVX2 void activation_avx2(const float* g, const float* u, float* h, int n, float sg, float su, float gcap,
+                              float ucap) {
+    const __m256 vsg = _mm256_set1_ps(sg), vsu = _mm256_set1_ps(su), vgc = _mm256_set1_ps(gcap),
+                 vuc = _mm256_set1_ps(ucap);
+    int r = 0;
+    for (; r + 8 <= n; r += 8)
+        _mm256_storeu_ps(h + r, act_avx2(_mm256_loadu_ps(g + r), _mm256_loadu_ps(u + r), vsg, vsu, vgc, vuc));
+    if (r < n) {
+        float tg[8] = {}, tu[8] = {}, th[8];
+        std::memcpy(tg, g + r, (size_t) (n - r) * sizeof(float));
+        std::memcpy(tu, u + r, (size_t) (n - r) * sizeof(float));
+        _mm256_storeu_ps(th, act_avx2(_mm256_loadu_ps(tg), _mm256_loadu_ps(tu), vsg, vsu, vgc, vuc));
+        std::memcpy(h + r, th, (size_t) (n - r) * sizeof(float));
     }
 }
 #endif
@@ -234,7 +463,7 @@ void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* o
         return;
     }
     if (avx2_ok()) {
-        q8_0_rows_avx2(W, K, r0, r1, x, out);
+        rows_n_avx2<Q8>(W, K, r0, r1, 1, &x, &out);
         return;
     }
 #endif
@@ -248,11 +477,55 @@ void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* 
         return;
     }
     if (avx2_ok()) {
-        nvfp4_rows_avx2(W, K, r0, r1, x, out);
+        rows_n_avx2<Nvfp4>(W, K, r0, r1, 1, &x, &out);
         return;
     }
 #endif
     nvfp4_rows_scalar(W, K, r0, r1, x, out);
+}
+
+namespace {
+// The same rows against n inputs: outs[q][r - r0] = W[r] . xs[q], bit for bit what nvfp4_rows / q8_0_rows give
+// for xs[q].  AVX2: the weights read and decoded once for all of them.  (AVX-512 and scalar: the single-input
+// kernel an input - a row block is still in the core's cache the next time.)
+void rows_n(bool q8, const uint8_t* W, int K, int r0, int r1, int n, const float* const* xs, float* const* outs) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (!avx512_ok() && avx2_ok()) {
+        if (q8)
+            rows_n_avx2<Q8>(W, K, r0, r1, n, xs, outs);
+        else
+            rows_n_avx2<Nvfp4>(W, K, r0, r1, n, xs, outs);
+        return;
+    }
+#endif
+    for (int q = 0; q < n; ++q) (q8 ? q8_0_rows : nvfp4_rows)(W, K, r0, r1, xs[q], outs[q]);
+}
+
+// h[r] = gcap tanh(gs / gcap) sigmoid(gs) ucap tanh(us / ucap), gs = g[r] sg, us = u[r] su, for n rows
+void activation(const float* g, const float* u, float* h, int n, float sg, float su, float gcap, float ucap) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (avx2_ok()) {
+        activation_avx2(g, u, h, n, sg, su, gcap, ucap);
+        return;
+    }
+#endif
+    for (int r = 0; r < n; ++r) {
+        const float gs = g[r] * sg, us = u[r] * su;
+        h[r] = gcap * std::tanh(gs / gcap) * (1.0f / (1.0f + std::exp(-gs))) * ucap * std::tanh(us / ucap);
+    }
+}
+}  // namespace
+
+void nvfp4_rows2(const uint8_t* W, int K, int r0, int r1, const float* x0, const float* x1, float* out0, float* out1) {
+    const float* xs[2] = {x0, x1};
+    float* outs[2] = {out0, out1};
+    rows_n(false, W, K, r0, r1, 2, xs, outs);
+}
+
+void q8_0_rows2(const uint8_t* W, int K, int r0, int r1, const float* x0, const float* x1, float* out0, float* out1) {
+    const float* xs[2] = {x0, x1};
+    float* outs[2] = {out0, out1};
+    rows_n(true, W, K, r0, r1, 2, xs, outs);
 }
 
 namespace {
@@ -323,14 +596,22 @@ Pool::~Pool() {
 
 void Pool::add(ExpertJob* job, int C, int F, float gcap, float ucap) {
     const int j = n_jobs_.load();
-    if (j >= kMaxJobs) std::abort();
+    if (j == 0) n_rows_ = 0;   // (wait() emptied the list)
+    const int n_in = std::max(1, job->n_in);
+    if (j >= kMaxJobs || n_rows_ + n_in > kMaxJobs || n_in > ExpertJob::kMaxIn) std::abort();
     if (F > scratch_F_) {   // (the first expert, or a wider model: no batch is in flight unless j > 0)
         if (j > 0) std::abort();
-        scratch_.assign((size_t) kMaxJobs * 3 * F, 0.0f);
-        scratch_F_ = F;
+        // (every g / u / h starts a cache line - h is down's input, 32 bytes a load: F up to a multiple of 16,
+        //  and 16 values of slack for the first line)
+        scratch_F_ = (F + 15) / 16 * 16;
+        scratch_.assign((size_t) kMaxJobs * 3 * scratch_F_ + 16, 0.0f);
     }
     job->C = C, job->F = F, job->gcap = gcap, job->ucap = ucap;
-    job->g = scratch_.data() + (size_t) j * 3 * scratch_F_;
+    job->n_in = n_in;
+    // (input k's gate / up sums and activation: scratch row n_rows_ + k, as g / u / h + k * 3 * scratch_F_)
+    float* const scratch = (float*) (((uintptr_t) scratch_.data() + 63) & ~(uintptr_t) 63);
+    job->g = scratch + (size_t) n_rows_ * 3 * scratch_F_;
+    n_rows_ += n_in;
     job->u = job->g + scratch_F_;
     job->h = job->u + scratch_F_;
     job->n_a = (F + kRowsA - 1) / kRowsA, job->n_b = (C + kRowsB - 1) / kRowsB;
@@ -348,25 +629,31 @@ void Pool::add(ExpertJob* job, int C, int F, float gcap, float ucap) {
 }
 
 // The posted experts' row blocks until none is left to take: gate's and up's rows with their activation, then -
-// once all of an expert's activation is there - down's rows.
+// once all of an expert's activation is there - down's rows.  A row block's bytes are read once for all the
+// inputs of its job (rows_n); a job of one input goes the same way.
 void Pool::work() {
     for (;;) {
         const int n = n_jobs_.load(std::memory_order_acquire);
         bool took = false, pending = false;
         for (int j = 0; j < n; ++j) {
             ExpertJob& J = *jobs_[j];
-            const auto rows = J.q8 ? q8_0_rows : nvfp4_rows;
+            const int ni = J.n_in;
+            const size_t ld = (size_t) 3 * scratch_F_;   // (an input's g / u / h)
+            const float* const* xs = ni > 1 ? J.xs : &J.x;
+            float* const* ys = ni > 1 ? J.ys : &J.y;
+            const float* hs[ExpertJob::kMaxIn];
+            float* o[ExpertJob::kMaxIn];
             while (J.next_a.load(std::memory_order_relaxed) < J.n_a) {
                 const int i = J.next_a.fetch_add(1);
                 if (i >= J.n_a) break;
                 const int r0 = i * kRowsA, r1 = std::min(J.F, r0 + kRowsA);
-                rows(J.gate, J.C, r0, r1, J.x, J.g + r0);
-                rows(J.up, J.C, r0, r1, J.x, J.u + r0);
-                for (int r = r0; r < r1; ++r) {
-                    const float gs = J.g[r] * J.sg, us = J.u[r] * J.su;
-                    J.h[r] = J.gcap * std::tanh(gs / J.gcap) * (1.0f / (1.0f + std::exp(-gs))) * J.ucap *
-                             std::tanh(us / J.ucap);
-                }
+                for (int q = 0; q < ni; ++q) o[q] = J.g + q * ld + r0;
+                rows_n(J.q8, J.gate, J.C, r0, r1, ni, xs, o);
+                for (int q = 0; q < ni; ++q) o[q] = J.u + q * ld + r0;
+                rows_n(J.q8, J.up, J.C, r0, r1, ni, xs, o);
+                for (int q = 0; q < ni; ++q)
+                    activation(J.g + q * ld + r0, J.u + q * ld + r0, J.h + q * ld + r0, r1 - r0, J.sg, J.su, J.gcap,
+                               J.ucap);
                 J.done_a.fetch_add(1, std::memory_order_release);
                 took = true;
             }
@@ -374,11 +661,13 @@ void Pool::work() {
                 pending = true;
                 continue;
             }
+            for (int q = 0; q < ni; ++q) hs[q] = J.h + q * ld;
             while (J.next_b.load(std::memory_order_relaxed) < J.n_b) {
                 const int i = J.next_b.fetch_add(1);
                 if (i >= J.n_b) break;
                 const int r0 = i * kRowsB, r1 = std::min(J.C, r0 + kRowsB);
-                rows(J.down, J.F, r0, r1, J.h, J.y + r0);
+                for (int q = 0; q < ni; ++q) o[q] = ys[q] + r0;
+                rows_n(J.q8, J.down, J.F, r0, r1, ni, hs, o);
                 if (J.done_b.fetch_add(1, std::memory_order_release) + 1 == J.n_b) left_.fetch_sub(1);
                 took = true;
             }

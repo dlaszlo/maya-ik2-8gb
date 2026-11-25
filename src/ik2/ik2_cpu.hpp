@@ -23,7 +23,7 @@ struct ExpertJob;
 /// so no thread is left with a share of its own to finish; wait(): until every expert posted so far is done.  At most kMaxJobs experts between two wait()s.
 class Pool {
 public:
-    static constexpr int kMaxJobs = 64;
+    static constexpr int kMaxJobs = 128;   // (scratch rows: every input of every job between two wait()s)
     explicit Pool(int n);
     ~Pool();
     void add(ExpertJob* job, int C, int F, float gcap, float ucap);
@@ -35,6 +35,7 @@ private:
     std::vector<std::thread> th_;
     ExpertJob* jobs_[kMaxJobs] = {};
     std::atomic<int> n_jobs_{0}, left_{0}, active_{0};
+    int n_rows_ = 0;   // scratch rows the jobs posted since the last wait() hold (a job: one an input)
     alignas(64) std::atomic<uint64_t> epoch_{0};   // (a line of its own: idle workers wait for a write to it)
     alignas(64) std::atomic<bool> stop_{false};
     std::vector<float> scratch_;   // gate's, up's sums and the activation of every job, [kMaxJobs][3][F]
@@ -48,6 +49,10 @@ private:
 void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out);
 /// The same for a Q8_0 matrix (ggml's 34-byte blocks: an FP16 scale, then 32 int8 values; K % 32 == 0).
 void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out);
+/// The same rows against two inputs, the weights read and decoded once: out0 / out1 are bit for bit what
+/// nvfp4_rows / q8_0_rows give for x0 / x1 (each input's sums in the same order).
+void nvfp4_rows2(const uint8_t* W, int K, int r0, int r1, const float* x0, const float* x1, float* out0, float* out1);
+void q8_0_rows2(const uint8_t* W, int K, int r0, int r1, const float* x0, const float* x1, float* out0, float* out1);
 
 /// One NVFP4 expert: gate, up [F][C] and down [C][F] blocks, x [C]; y [C] = down . h, h = gcap tanh(g / gcap)
 /// sigmoid(g) ucap tanh(u / ucap), g = (gate . x) sg, u = (up . x) su - the raw sums of down (its scale is the
@@ -58,6 +63,13 @@ struct ExpertJob {
     float sg = 1.0f, su = 1.0f;
     bool q8 = false;   // the three matrices are Q8_0 instead of NVFP4
     float* y = nullptr;
+    // More tokens of one call on the same expert (a verify window's): n_in inputs xs[k] -> ys[k], the expert's
+    // blocks read once for all of them.  n_in == 1: x and y above (xs / ys unused).  A job takes n_in of the
+    // pool's kMaxJobs scratch rows.
+    static constexpr int kMaxIn = 16;
+    int n_in = 1;
+    const float* xs[kMaxIn] = {};
+    float* ys[kMaxIn] = {};
     // (the pool's: the shapes, its scratch rows and the row blocks taken and done of gate / up and of down)
     int C = 0, F = 0, n_a = 0, n_b = 0;
     float gcap = 0.0f, ucap = 0.0f;
